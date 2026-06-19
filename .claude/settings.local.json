@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx --yes create-next-app@latest . --typescript --tailwind --eslint --app --src-dir=false --import-alias \"@/*\" --use-npm --yes)",
+      "Bash(npx --yes create-next-app@latest choir-note-reader --typescript --tailwind --eslint --app --src-dir=false --import-alias \"@/*\" --use-npm --yes)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:3000)",
+      "Bash(gh release *)",
+      "Bash(curl -s https://api.github.com/repos/Audiveris/audiveris/releases/latest)",
+      "Bash(./Audiveris.exe -version)",
+      "Bash(npm ls *)",
+      "Bash(cd \"/c/Users/Gyeonghwan Do/OneDrive/Documents/Choire note reader\" && cat node_modules/opensheetmusicdisplay/package.json | grep -E '\"\\(main|module|types|exports\\)\"' -A 3)",
+      "Bash(xargs -I{} sh -c 'echo \"== {} ==\"; cat \"{}\"')",
+      "Bash(cd \"/c/Users/Gyeonghwan Do/OneDrive/Documents/Choire note reader\" && cat node_modules/next/package.json | grep '\"version\"')"
+    ]
+  }
+}
