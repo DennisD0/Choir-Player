@@ -33,6 +33,12 @@ export interface ScorePart {
   label: string;
   role: PartRole;
   notes: NoteEvent[];
+  /**
+   * Global staff indices (into OSMD's MeasureList[measure][staff]) this part
+   * is rendered on, so the UI can highlight the right staff. Soprano/alto
+   * share the upper choral staff; tenor/bass share the lower one.
+   */
+  staves: number[];
 }
 
 const ROLE_PATTERNS: { role: PartRole; pattern: RegExp }[] = [
@@ -53,83 +59,224 @@ function detectRole(text: string | undefined | null): PartRole | undefined {
   return undefined;
 }
 
+type Instrument = MusicSheet["Instruments"][number];
+
+/** A note plus its numeric pitch, used while splitting chords by height. */
+type RawNote = NoteEvent & { halfTone: number };
+
+const ROLE_LABELS: Record<PartRole, string> = {
+  soprano: "Soprano",
+  alto: "Alto",
+  tenor: "Tenor",
+  bass: "Bass",
+  piano: "Piano",
+  other: "Other",
+};
+
+/** Strip the sort-only halfTone field back to a plain NoteEvent. */
+function toNoteEvent({ onsetTicks, durationTicks, pitch }: RawNote): NoteEvent {
+  return { onsetTicks, durationTicks, pitch };
+}
+
+/** Every pitched note of an instrument, across all its voices. */
+function collectNotes(instrument: Instrument): RawNote[] {
+  const notes: RawNote[] = [];
+  for (const voice of instrument.Voices) {
+    for (const entry of voice.VoiceEntries) {
+      for (const note of entry.Notes) {
+        if (note.isRest()) continue;
+        const pitch = note.Pitch;
+        if (!pitch) continue;
+
+        // Honor ties: a tie binds the same pitch across notes into one held
+        // note. Emit it once (at the tie's start) with the summed duration and
+        // skip the continuations. Slurs are a separate object and untouched.
+        const tie = note.NoteTie;
+        let durationWhole = note.Length.RealValue;
+        if (tie) {
+          if (tie.StartNote && note !== tie.StartNote) continue;
+          const tied = tie.Notes ?? [note];
+          durationWhole = tied.reduce((sum, n) => sum + n.Length.RealValue, 0);
+        }
+
+        const onsetWhole = note.getAbsoluteTimestamp().RealValue;
+        notes.push({
+          onsetTicks: Math.round(onsetWhole * TICKS_PER_WHOLE_NOTE),
+          durationTicks: Math.max(
+            1,
+            Math.round(durationWhole * TICKS_PER_WHOLE_NOTE)
+          ),
+          pitch: pitch.ToStringShort(),
+          halfTone: pitch.getHalfTone(),
+        });
+      }
+    }
+  }
+  return notes;
+}
+
 /**
- * Walks the parsed OSMD music sheet and extracts one ScorePart per
- * (instrument, voice) pair, with note events expressed in Transport ticks.
- *
- * Part roles (S/A/T/B/Piano) are guessed from instrument names/abbreviations.
- * Any part whose role couldn't be detected is filled in with the SATB roles
- * not yet used, in document order - this matches the conventional layout of
- * closed-score hymnals (treble staff voice 1/2 = soprano/alto, bass staff
- * voice 1/2 = tenor/bass). Callers should let the user override the result.
+ * Split one choral staff into its top line (soprano/tenor) and second line
+ * (alto/bass). Notes sharing an onset form a chord: the highest is the top
+ * voice, the next-highest the second voice. A lone note at an onset is a
+ * unison and is sung by both lines.
  */
-export function extractParts(sheet: MusicSheet): ScorePart[] {
-  interface RawPart {
-    id: string;
-    label: string;
-    role?: PartRole;
-    notes: NoteEvent[];
+function splitStaff(notes: RawNote[]): { top: NoteEvent[]; second: NoteEvent[] } {
+  const byOnset = new Map<number, RawNote[]>();
+  for (const note of notes) {
+    const group = byOnset.get(note.onsetTicks);
+    if (group) group.push(note);
+    else byOnset.set(note.onsetTicks, [note]);
   }
 
-  const rawParts: RawPart[] = [];
+  const top: NoteEvent[] = [];
+  const second: NoteEvent[] = [];
+  for (const group of byOnset.values()) {
+    group.sort((a, b) => b.halfTone - a.halfTone); // highest pitch first
+    top.push(toNoteEvent(group[0]));
+    second.push(toNoteEvent(group[1] ?? group[0]));
+  }
+  top.sort((a, b) => a.onsetTicks - b.onsetTicks);
+  second.sort((a, b) => a.onsetTicks - b.onsetTicks);
+  return { top, second };
+}
 
-  sheet.Instruments.forEach((instrument, instrumentIndex) => {
-    const voices = instrument.Voices;
-    const instrumentName = instrument.Name;
-    const instrumentRole =
-      detectRole(instrumentName) ?? detectRole(instrument.PartAbbreviation);
+/** Drop notes that repeat the same pitch at the same onset. */
+function dedupe(notes: NoteEvent[]): NoteEvent[] {
+  const seen = new Set<string>();
+  const out: NoteEvent[] = [];
+  for (const note of notes) {
+    const key = `${note.onsetTicks}:${note.pitch}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(note);
+  }
+  return out;
+}
 
-    voices.forEach((voice, voiceIndex) => {
-      const notes: NoteEvent[] = [];
-
-      for (const entry of voice.VoiceEntries) {
-        for (const note of entry.Notes) {
-          if (note.isRest()) continue;
-          const pitch = note.Pitch;
-          if (!pitch) continue;
-
-          const onsetWhole = note.getAbsoluteTimestamp().RealValue;
-          const durationWhole = note.Length.RealValue;
-
-          notes.push({
-            onsetTicks: Math.round(onsetWhole * TICKS_PER_WHOLE_NOTE),
-            durationTicks: Math.max(
-              1,
-              Math.round(durationWhole * TICKS_PER_WHOLE_NOTE)
-            ),
-            pitch: pitch.ToStringShort(),
-          });
-        }
-      }
-
-      notes.sort((a, b) => a.onsetTicks - b.onsetTicks);
-
-      const label =
-        voices.length > 1
-          ? `${instrumentName || `Part ${instrumentIndex + 1}`} (Voice ${voiceIndex + 1})`
-          : instrumentName || `Part ${instrumentIndex + 1}`;
-
-      rawParts.push({
-        id: `${instrumentIndex}-${voiceIndex}`,
-        label,
-        role: instrumentRole,
-        notes,
-      });
-    });
+/**
+ * Extracts S/A/T/B/Piano parts from the parsed OSMD sheet.
+ *
+ * Most choral scores are written "closed": two staves named generically
+ * (e.g. "Voice"), the upper carrying soprano (top) + alto (below) and the
+ * lower carrying tenor (top) + bass (below), stacked as chords. We detect
+ * that layout and split each staff by pitch. Scores that explicitly name
+ * their parts (Soprano/Alto/... ) are taken at face value instead.
+ *
+ * The piano part is used when present; when a score has no written piano,
+ * the Piano part instead plays every voice at once, so the keyboard option
+ * always sounds the full texture.
+ */
+export function extractParts(sheet: MusicSheet): ScorePart[] {
+  // Global staff index per instrument, in document order — matches OSMD's
+  // MeasureList[measure][staff] indexing used for highlighting.
+  const stavesOf = new Map<Instrument, number[]>();
+  let staffCursor = 0;
+  sheet.Instruments.forEach((instrument) => {
+    const count = Math.max(1, instrument.Staves?.length ?? 1);
+    const indices: number[] = [];
+    for (let i = 0; i < count; i++) indices.push(staffCursor++);
+    stavesOf.set(instrument, indices);
   });
 
-  // Fill in undetected roles with the SATB roles not yet claimed, in
-  // document order. Anything left over (e.g. more than 4 unlabeled parts)
-  // falls back to "other".
-  const usedRoles = new Set(rawParts.map((p) => p.role).filter(Boolean));
-  const fallbackQueue: PartRole[] = (["soprano", "alto", "tenor", "bass"] as PartRole[]).filter(
-    (role) => !usedRoles.has(role)
-  );
+  const pianoInstruments: Instrument[] = [];
+  const namedVocals = new Map<PartRole, Instrument>();
+  const unnamedVocals: Instrument[] = [];
 
-  return rawParts.map((part) => ({
-    id: part.id,
-    label: part.label,
-    role: part.role ?? fallbackQueue.shift() ?? "other",
-    notes: part.notes,
-  }));
+  sheet.Instruments.forEach((instrument) => {
+    const role =
+      detectRole(instrument.Name) ?? detectRole(instrument.PartAbbreviation);
+    if (role === "piano") {
+      pianoInstruments.push(instrument);
+    } else if (
+      role === "soprano" ||
+      role === "alto" ||
+      role === "tenor" ||
+      role === "bass"
+    ) {
+      if (!namedVocals.has(role)) namedVocals.set(role, instrument);
+    } else {
+      unnamedVocals.push(instrument);
+    }
+  });
+
+  const roleNotes = new Map<PartRole, NoteEvent[]>();
+  const roleStaves = new Map<PartRole, Set<number>>();
+  const addNotes = (role: PartRole, notes: NoteEvent[]): void => {
+    if (notes.length === 0) return;
+    const existing = roleNotes.get(role);
+    if (existing) existing.push(...notes);
+    else roleNotes.set(role, notes);
+  };
+  const addStaves = (role: PartRole, ...instruments: Instrument[]): void => {
+    let set = roleStaves.get(role);
+    if (!set) roleStaves.set(role, (set = new Set<number>()));
+    for (const instrument of instruments) {
+      for (const index of stavesOf.get(instrument) ?? []) set.add(index);
+    }
+  };
+
+  // Parts the score labelled explicitly are taken as-is.
+  for (const [role, instrument] of namedVocals) {
+    addNotes(role, collectNotes(instrument).map(toNoteEvent));
+    addStaves(role, instrument);
+  }
+
+  if (namedVocals.size === 0) {
+    // Closed score: split the upper staff into S/A and the lower into T/B.
+    // Both voices on a staff share that staff for highlighting.
+    const [upper, lower] = unnamedVocals;
+    if (upper) {
+      const { top, second } = splitStaff(collectNotes(upper));
+      addNotes("soprano", top);
+      addNotes("alto", second);
+      addStaves("soprano", upper);
+      addStaves("alto", upper);
+    }
+    if (lower) {
+      const { top, second } = splitStaff(collectNotes(lower));
+      addNotes("tenor", top);
+      addNotes("bass", second);
+      addStaves("tenor", lower);
+      addStaves("bass", lower);
+    }
+    for (let i = 2; i < unnamedVocals.length; i++) {
+      addNotes("other", collectNotes(unnamedVocals[i]).map(toNoteEvent));
+      addStaves("other", unnamedVocals[i]);
+    }
+  } else {
+    for (const instrument of unnamedVocals) {
+      addNotes("other", collectNotes(instrument).map(toNoteEvent));
+      addStaves("other", instrument);
+    }
+  }
+
+  if (pianoInstruments.length > 0) {
+    for (const instrument of pianoInstruments) {
+      addNotes("piano", collectNotes(instrument).map(toNoteEvent));
+      addStaves("piano", instrument);
+    }
+  } else {
+    // No written piano: play (and highlight) all of the voices together.
+    const everything: NoteEvent[] = [];
+    const pianoStaves = new Set<number>();
+    for (const role of ["soprano", "alto", "tenor", "bass", "other"] as PartRole[]) {
+      const notes = roleNotes.get(role);
+      if (notes) everything.push(...notes.map((n) => ({ ...n })));
+      for (const index of roleStaves.get(role) ?? []) pianoStaves.add(index);
+    }
+    addNotes("piano", dedupe(everything));
+    if (roleNotes.has("piano")) roleStaves.set("piano", pianoStaves);
+  }
+
+  const order: PartRole[] = ["soprano", "alto", "tenor", "bass", "piano", "other"];
+  const parts: ScorePart[] = [];
+  for (const role of order) {
+    const notes = roleNotes.get(role);
+    if (!notes || notes.length === 0) continue;
+    notes.sort((a, b) => a.onsetTicks - b.onsetTicks);
+    const staves = [...(roleStaves.get(role) ?? [])].sort((a, b) => a - b);
+    parts.push({ id: role, label: ROLE_LABELS[role], role, notes, staves });
+  }
+  return parts;
 }

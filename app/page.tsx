@@ -7,11 +7,12 @@ import {
   type PartRole,
   type ScorePart,
 } from "@/lib/musicxml-parts";
+import { partsToMidi } from "@/lib/midi-export";
 import type { AudioEngine } from "@/lib/audio-engine";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 
 type Stage = "idle" | "uploading" | "processing" | "loading" | "ready" | "error";
-type VoiceFilter = "all" | "choir" | "piano" | "soprano" | "alto" | "tenor" | "bass";
+type VoiceFilter = "piano" | "soprano" | "alto" | "tenor" | "bass";
 
 // These four are both valid PartRoles and VoiceFilters.
 const VOCAL_ROLES: (PartRole & VoiceFilter)[] = [
@@ -21,32 +22,46 @@ const VOCAL_ROLES: (PartRole & VoiceFilter)[] = [
   "bass",
 ];
 
-// Octave shift applied to playback. Defaults high because piano-sampler
-// playback of choral scores sits low; users can dial it back down.
+// Fixed octave shift applied to playback: choral parts on a piano sampler sit
+// low, so everything is raised by this many octaves.
 const DEFAULT_OCTAVE = 3;
-const MIN_OCTAVE = -2;
-const MAX_OCTAVE = 4;
+
+/** Light-blue highlight drawn over the staff(s) currently being played. */
+const HIGHLIGHT_FILL = "rgba(59, 130, 246, 0.16)";
+const HIGHLIGHT_BORDER = "rgba(59, 130, 246, 0.55)";
+/** Red tint for the notes inside the highlighted measure. */
+const NOTE_RED = "#ef4444";
 
 /** Pre-processed demo score so the app can be tried instantly, no OMR wait. */
 const DEMO_URL = "/presets/remember-me.mxl";
 const DEMO_NAME = "기억하라 (Remember Me) — demo";
 
-function shouldMute(role: PartRole, filter: VoiceFilter): boolean {
-  if (filter === "all") return false;
-  if (filter === "choir") return role === "piano" || role === "other";
-  if (filter === "piano") return role !== "piano";
-  return (role as string) !== (filter as string);
-}
-
 const FILTER_LABELS: Record<VoiceFilter, string> = {
-  all: "All",
-  choir: "Choir",
   piano: "Piano",
   soprano: "Soprano",
   alto: "Alto",
   tenor: "Tenor",
   bass: "Bass",
 };
+
+/** Voice-filter pills available for a set of parts, in display order. */
+function filtersForParts(parts: ScorePart[]): VoiceFilter[] {
+  const roles = new Set(parts.map((p) => p.role));
+  const filters: VoiceFilter[] = [];
+  if (roles.has("piano")) filters.push("piano");
+  for (const role of VOCAL_ROLES) {
+    if (roles.has(role)) filters.push(role);
+  }
+  return filters;
+}
+
+/** A pixel rectangle in the score container's coordinate space. */
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
@@ -62,8 +77,7 @@ export default function Home() {
   const [fileName, setFileName] = useState<string | null>(null);
 
   const [parts, setParts] = useState<ScorePart[]>([]);
-  const [voiceFilter, setVoiceFilter] = useState<VoiceFilter>("all");
-  const [octave, setOctave] = useState(DEFAULT_OCTAVE);
+  const [selectedRoles, setSelectedRoles] = useState<VoiceFilter[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [bpm, setBpm] = useState(DEFAULT_BPM);
   const [positionSec, setPositionSec] = useState(0);
@@ -71,12 +85,23 @@ export default function Home() {
   const [resultUrl, setResultUrl] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
   const engineRef = useRef<AudioEngine | null>(null);
 
-  const stepOnsetsRef = useRef<number[]>([]);
-  const stepIndexRef = useRef(0);
   const rafRef = useRef<number | null>(null);
+  // Per-measure, per-staff pixel rectangles for drawing staff highlights.
+  const measureRectsRef = useRef<(Rect | null)[][]>([]);
+  // Tick at which each measure begins, for mapping playback time → measure.
+  const measureStartTicksRef = useRef<number[]>([]);
+  const currentMeasureRef = useRef(-1);
+  // Live mirrors of state read inside rAF / observer callbacks.
+  const partsRef = useRef<ScorePart[]>([]);
+  const selectedRef = useRef<VoiceFilter[]>([]);
+  // SVG notes currently tinted red, so they can be reverted on the next move.
+  const coloredNotesRef = useRef<SVGElement[]>([]);
+  // Rebuilds highlight geometry whenever OSMD re-renders the score SVG.
+  const resizeObsRef = useRef<MutationObserver | null>(null);
 
   const cancelLoop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -88,31 +113,140 @@ export default function Home() {
   useEffect(() => {
     return () => {
       cancelLoop();
+      resizeObsRef.current?.disconnect();
       engineRef.current?.dispose();
     };
   }, [cancelLoop]);
 
-  const syncCursor = useCallback((posTicks: number) => {
+  useEffect(() => {
+    partsRef.current = parts;
+  }, [parts]);
+  useEffect(() => {
+    selectedRef.current = selectedRoles;
+  }, [selectedRoles]);
+
+  /** Recompute per-measure, per-staff pixel rectangles from OSMD's layout. */
+  const buildMeasureRects = useCallback(() => {
     const osmd = osmdRef.current;
-    const onsets = stepOnsetsRef.current;
-    if (!osmd || onsets.length === 0) return;
+    const container = containerRef.current;
+    if (!osmd || !container) return;
+    const svg = container.querySelector("svg");
+    if (!svg) return;
 
-    let target = 0;
-    while (target + 1 < onsets.length && onsets[target + 1] <= posTicks) {
-      target += 1;
-    }
-    if (posTicks < onsets[0]) target = 0;
+    const svgBox = svg.getBoundingClientRect();
+    const contBox = container.getBoundingClientRect();
+    const offsetX = svgBox.left - contBox.left;
+    const offsetY = svgBox.top - contBox.top;
 
-    if (target < stepIndexRef.current) {
-      osmd.cursor.reset();
-      stepIndexRef.current = 0;
-    }
-    while (stepIndexRef.current < target) {
-      osmd.cursor.next();
-      stepIndexRef.current += 1;
-    }
-    osmd.cursor.update();
+    // OSMD lays out in abstract units; the SVG is those units scaled to pixels.
+    const page = osmd.GraphicSheet?.MusicPages?.[0];
+    const pageWidth = page?.PositionAndShape?.Size?.width;
+    const factor =
+      pageWidth && pageWidth > 0 ? svgBox.width / pageWidth : 10 * (osmd.Zoom ?? 1);
+
+    // A staff's five lines span a fixed 4 OSMD units; bounding-box borders are
+    // content-driven (they collapse on rest measures and balloon around notes),
+    // so use the StaffLine's top with that fixed height. padY clears the lines.
+    const STAFF_UNITS = 4;
+    const padY = 1.2;
+    const list = osmd.GraphicSheet?.MeasureList ?? [];
+    measureRectsRef.current = list.map((staves) =>
+      staves.map((measure) => {
+        const ps = measure?.PositionAndShape;
+        if (!ps) return null;
+        // Horizontal extent from the measure, vertical band from its staff.
+        const sps = measure.ParentStaffLine?.PositionAndShape;
+        const top = sps ? sps.AbsolutePosition.y : ps.AbsolutePosition.y;
+        return {
+          x: offsetX + (ps.AbsolutePosition.x + ps.BorderLeft) * factor,
+          y: offsetY + (top - padY) * factor,
+          w: (ps.BorderRight - ps.BorderLeft) * factor,
+          h: (STAFF_UNITS + 2 * padY) * factor,
+        };
+      })
+    );
   }, []);
+
+  /**
+   * Draw blue boxes over the selected parts' staves for the current measure,
+   * and tint the notes inside those staves red. Reverts the previous notes.
+   */
+  const drawHighlights = useCallback((autoScroll = false) => {
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+
+    const staffIndices = new Set<number>();
+    for (const part of partsRef.current) {
+      if (selectedRef.current.includes(part.role as VoiceFilter)) {
+        for (const staff of part.staves) staffIndices.add(staff);
+      }
+    }
+
+    for (const el of coloredNotesRef.current) el.style.fill = "";
+    coloredNotesRef.current = [];
+
+    const measureIndex = currentMeasureRef.current;
+    const row = measureRectsRef.current[measureIndex];
+    const fragment = document.createDocumentFragment();
+    let firstBox: HTMLDivElement | null = null;
+    if (row) {
+      for (const staff of staffIndices) {
+        const rect = row[staff];
+        if (!rect) continue;
+        const box = document.createElement("div");
+        box.style.cssText =
+          `position:absolute;left:${rect.x}px;top:${rect.y}px;` +
+          `width:${rect.w}px;height:${rect.h}px;background:${HIGHLIGHT_FILL};` +
+          `border:1.5px solid ${HIGHLIGHT_BORDER};border-radius:6px;` +
+          `box-sizing:border-box;pointer-events:none;`;
+        if (!firstBox) firstBox = box;
+        fragment.appendChild(box);
+      }
+    }
+    overlay.replaceChildren(fragment);
+
+    // Redden the noteheads in the highlighted measure on the selected staves.
+    const measures = osmdRef.current?.GraphicSheet?.MeasureList?.[measureIndex];
+    if (measures) {
+      type GNote = { getSVGGElement?: () => SVGGElement | null };
+      for (const staff of staffIndices) {
+        const measure = measures[staff];
+        for (const entry of measure?.staffEntries ?? []) {
+          for (const voiceEntry of entry.graphicalVoiceEntries ?? []) {
+            for (const note of voiceEntry.notes ?? []) {
+              const el = (note as unknown as GNote).getSVGGElement?.();
+              if (!el) continue;
+              el.style.fill = NOTE_RED;
+              coloredNotesRef.current.push(el);
+              el.querySelectorAll<SVGElement>("*").forEach((child) => {
+                child.style.fill = NOTE_RED;
+                coloredNotesRef.current.push(child);
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (autoScroll) firstBox?.scrollIntoView({ block: "nearest" });
+  }, []);
+
+  /** Map a playback position (ticks) to its measure and redraw if it changed. */
+  const syncHighlight = useCallback(
+    (posTicks: number) => {
+      const starts = measureStartTicksRef.current;
+      if (starts.length === 0) return;
+      let measure = 0;
+      for (let i = 0; i < starts.length; i++) {
+        if (starts[i] <= posTicks) measure = i;
+        else break;
+      }
+      if (measure === currentMeasureRef.current) return;
+      currentMeasureRef.current = measure;
+      drawHighlights(true);
+    },
+    [drawHighlights]
+  );
 
   const tick = useCallback(() => {
     const engine = engineRef.current;
@@ -121,20 +255,19 @@ export default function Home() {
     const posSec = engine.getPositionSeconds();
     const dur = engine.getDurationSeconds();
     setPositionSec(posSec);
-    syncCursor(engine.getPositionTicks());
+    syncHighlight(engine.getPositionTicks());
 
     if (posSec >= dur && dur > 0) {
       engine.stop();
       setIsPlaying(false);
       setPositionSec(0);
-      stepIndexRef.current = 0;
-      osmdRef.current?.cursor.reset();
-      osmdRef.current?.cursor.update();
+      currentMeasureRef.current = 0;
+      drawHighlights();
       cancelLoop();
       return;
     }
     rafRef.current = requestAnimationFrame(tick);
-  }, [syncCursor, cancelLoop]);
+  }, [syncHighlight, drawHighlights, cancelLoop]);
 
   const loadScore = useCallback(async (musicXmlUrl: string) => {
     setStage("loading");
@@ -151,44 +284,61 @@ export default function Home() {
 
       if (!containerRef.current) throw new Error("Score container not ready");
 
-      osmdRef.current?.cursor?.hide();
       const osmd = new OpenSheetMusicDisplay(containerRef.current, {
         autoResize: true,
         backend: "svg",
         drawTitle: true,
-        followCursor: true,
-        // Red box highlight around the current notes (type 0 = note box).
-        cursorsOptions: [{ type: 0, color: "#ef4444", alpha: 0.4, follow: true }],
       });
       osmdRef.current = osmd;
 
       const blob = await fetch(musicXmlUrl).then((r) => r.blob());
       await osmd.load(blob);
+      // Pack ~4 measures per system (two ends + a couple in the middle): cap
+      // the per-line count and zoom out so they actually fit, instead of OSMD's
+      // width-driven default that puts a single wide measure on each line. Must
+      // be set after load() — load resets zoom.
+      osmd.EngravingRules.RenderXMeasuresPerLineAkaSystem = 4;
+      osmd.zoom = 0.5;
       osmd.render();
+      osmd.cursor?.hide();
 
+      // Walk the score once to learn the tick where each measure begins, so a
+      // playback position can be mapped to the measure to highlight.
+      const measureStartTicks: number[] = [];
       osmd.cursor.reset();
-      const onsets: number[] = [];
       let guard = 0;
       while (!osmd.cursor.Iterator.EndReached && guard < 100000) {
-        onsets.push(
-          osmd.cursor.Iterator.currentTimeStamp.RealValue * TICKS_PER_WHOLE_NOTE
-        );
+        const measure = osmd.cursor.Iterator.CurrentMeasureIndex;
+        const tick =
+          osmd.cursor.Iterator.currentTimeStamp.RealValue * TICKS_PER_WHOLE_NOTE;
+        if (measureStartTicks[measure] === undefined) {
+          measureStartTicks[measure] = tick;
+        }
         osmd.cursor.next();
         guard += 1;
       }
       osmd.cursor.reset();
-      // Re-assert the red note-box style (belt-and-suspenders vs. the
-      // constructor option) and paint it at the start position.
-      osmd.cursor.CursorOptions = {
-        type: 0,
-        color: "#ef4444",
-        alpha: 0.45,
-        follow: true,
-      };
-      osmd.cursor.show();
-      osmd.cursor.update();
-      stepOnsetsRef.current = onsets;
-      stepIndexRef.current = 0;
+      osmd.cursor.hide();
+      // Forward-fill empty measures so the tick→measure lookup stays monotonic.
+      for (let i = 0, last = 0; i < measureStartTicks.length; i++) {
+        if (measureStartTicks[i] === undefined) measureStartTicks[i] = last;
+        else last = measureStartTicks[i];
+      }
+      measureStartTicksRef.current = measureStartTicks;
+      currentMeasureRef.current = 0;
+
+      buildMeasureRects();
+
+      // OSMD's autoResize re-lays-out the SVG (just after load, and on window
+      // resize), which shifts every measure. Recompute geometry and redraw the
+      // highlights whenever the score's structure changes.
+      resizeObsRef.current?.disconnect();
+      const observer = new MutationObserver(() => {
+        buildMeasureRects();
+        drawHighlights();
+      });
+      observer.observe(containerRef.current, { childList: true, subtree: true });
+      resizeObsRef.current = observer;
 
       const scoreParts = extractParts(osmd.Sheet);
       if (scoreParts.length === 0) {
@@ -210,9 +360,17 @@ export default function Home() {
       engine.setBpm(startBpm);
       engine.setTranspose(DEFAULT_OCTAVE * 12);
 
+      // Start with every part selected and audible; the user narrows from there.
+      const initialSelection = filtersForParts(scoreParts);
+      scoreParts.forEach((p) =>
+        engine.setMute(p.id, !initialSelection.includes(p.role as VoiceFilter))
+      );
+
+      // Seed the refs synchronously so the first highlight draw has data.
+      partsRef.current = scoreParts;
+      selectedRef.current = initialSelection;
       setParts(scoreParts);
-      setVoiceFilter("all");
-      setOctave(DEFAULT_OCTAVE);
+      setSelectedRoles(initialSelection);
       setBpm(startBpm);
       setPositionSec(0);
       setDurationSec(engine.getDurationSeconds());
@@ -220,11 +378,13 @@ export default function Home() {
       setResultUrl(musicXmlUrl);
       setStage("ready");
       setStatusMsg("");
+
+      drawHighlights();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setStage("error");
     }
-  }, []);
+  }, [buildMeasureRects, drawHighlights]);
 
   const pollStatus = useCallback(
     async (jobId: string) => {
@@ -255,10 +415,18 @@ export default function Home() {
   const resetForLoad = useCallback(
     (name: string) => {
       cancelLoop();
+      resizeObsRef.current?.disconnect();
       engineRef.current?.dispose();
       engineRef.current = null;
+      overlayRef.current?.replaceChildren();
+      coloredNotesRef.current = [];
+      measureRectsRef.current = [];
+      measureStartTicksRef.current = [];
+      currentMeasureRef.current = -1;
+      partsRef.current = [];
+      selectedRef.current = [];
       setParts([]);
-      setVoiceFilter("all");
+      setSelectedRoles([]);
       setIsPlaying(false);
       setPositionSec(0);
       setDurationSec(0);
@@ -331,11 +499,10 @@ export default function Home() {
     engineRef.current?.stop();
     setIsPlaying(false);
     setPositionSec(0);
-    stepIndexRef.current = 0;
-    osmdRef.current?.cursor.reset();
-    osmdRef.current?.cursor.update();
+    currentMeasureRef.current = 0;
+    drawHighlights();
     cancelLoop();
-  }, [cancelLoop]);
+  }, [drawHighlights, cancelLoop]);
 
   const handleSeek = useCallback(
     (sec: number) => {
@@ -343,9 +510,9 @@ export default function Home() {
       if (!engine) return;
       engine.seek(sec);
       setPositionSec(sec);
-      syncCursor(engine.getPositionTicks());
+      syncHighlight(engine.getPositionTicks());
     },
-    [syncCursor]
+    [syncHighlight]
   );
 
   const handleBpm = useCallback((value: number) => {
@@ -354,20 +521,44 @@ export default function Home() {
     setDurationSec(engineRef.current?.getDurationSeconds() ?? 0);
   }, []);
 
-  const handleOctave = useCallback((next: number) => {
-    const clamped = Math.max(MIN_OCTAVE, Math.min(MAX_OCTAVE, next));
-    engineRef.current?.setTranspose(clamped * 12);
-    setOctave(clamped);
-  }, []);
+  const baseFileName = useMemo(
+    () => (fileName ? fileName.replace(/\.[^./\\]+$/, "") : "score"),
+    [fileName]
+  );
 
-  const handleFilterChange = useCallback(
-    (filter: VoiceFilter) => {
-      setVoiceFilter(filter);
-      const engine = engineRef.current;
-      if (!engine) return;
-      parts.forEach((p) => engine.setMute(p.id, shouldMute(p.role, filter)));
+  /** Export the parsed parts as a Standard MIDI File, matching playback pitch. */
+  const handleExportMidi = useCallback(() => {
+    if (parts.length === 0) return;
+    const bytes = partsToMidi(parts, bpm, DEFAULT_OCTAVE * 12);
+    const blob = new Blob([bytes as unknown as BlobPart], { type: "audio/midi" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${baseFileName}.mid`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [parts, bpm, baseFileName]);
+
+  /** Toggle a part in/out of the selection: only selected parts play (and get
+   *  highlighted). Multiple may be active at once. */
+  const toggleRole = useCallback(
+    (role: VoiceFilter) => {
+      setSelectedRoles((prev) => {
+        const next = prev.includes(role)
+          ? prev.filter((r) => r !== role)
+          : [...prev, role];
+        selectedRef.current = next;
+        const engine = engineRef.current;
+        if (engine) {
+          partsRef.current.forEach((p) =>
+            engine.setMute(p.id, !next.includes(p.role as VoiceFilter))
+          );
+        }
+        drawHighlights();
+        return next;
+      });
     },
-    [parts]
+    [drawHighlights]
   );
 
   useEffect(() => {
@@ -389,18 +580,7 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   }, [stage, isPlaying, handlePlay, handlePause]);
 
-  const availableFilters = useMemo((): VoiceFilter[] => {
-    const roles = new Set(parts.map((p) => p.role));
-    const hasVocals = VOCAL_ROLES.some((r) => roles.has(r));
-    const hasPiano = roles.has("piano");
-    const filters: VoiceFilter[] = ["all"];
-    if (hasPiano) filters.push("piano");
-    if (hasVocals && hasPiano) filters.push("choir");
-    for (const role of VOCAL_ROLES) {
-      if (roles.has(role)) filters.push(role);
-    }
-    return filters;
-  }, [parts]);
+  const availableFilters = useMemo(() => filtersForParts(parts), [parts]);
 
   const busy =
     stage === "uploading" || stage === "processing" || stage === "loading";
@@ -544,72 +724,57 @@ export default function Home() {
               </span>
             </div>
 
-            {/* Octave shift — raise the pitch if the piano range sits too low */}
-            <div className="flex items-center gap-3">
-              <span className="text-xs font-bold uppercase tracking-wide text-stone-400">
-                Octave
-              </span>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => handleOctave(octave - 1)}
-                  disabled={octave <= MIN_OCTAVE}
-                  className="flex h-9 w-9 items-center justify-center rounded-full bg-stone-100 text-lg font-bold text-stone-700 transition-colors hover:bg-stone-200 disabled:opacity-40"
-                  aria-label="Octave down"
-                >
-                  −
-                </button>
-                <span className="w-14 text-center text-sm font-bold tabular-nums text-blue-900">
-                  {octave > 0 ? `+${octave}` : octave}
-                </span>
-                <button
-                  onClick={() => handleOctave(octave + 1)}
-                  disabled={octave >= MAX_OCTAVE}
-                  className="flex h-9 w-9 items-center justify-center rounded-full bg-stone-100 text-lg font-bold text-stone-700 transition-colors hover:bg-stone-200 disabled:opacity-40"
-                  aria-label="Octave up"
-                >
-                  +
-                </button>
-              </div>
-              <span className="text-xs text-stone-400">
-                {octave === 0
-                  ? "as written"
-                  : `${octave > 0 ? "higher" : "lower"} by ${Math.abs(octave)} octave${Math.abs(octave) > 1 ? "s" : ""}`}
-              </span>
-            </div>
-
-            {/* Voice selector */}
+            {/* Voice selector — multi-select; only chosen parts play */}
             <div className="flex flex-col gap-2">
-              <span className="text-xs font-bold uppercase tracking-wide text-stone-400">
-                Voice
-              </span>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wide text-stone-400">
+                  Voices
+                </span>
+                <span className="text-xs text-stone-400">
+                  tap to toggle — pick any combination
+                </span>
+              </div>
               <div className="flex flex-wrap gap-2">
-                {availableFilters.map((filter) => (
-                  <button
-                    key={filter}
-                    onClick={() => handleFilterChange(filter)}
-                    className={`rounded-full border px-4 py-2 text-sm font-bold transition-all duration-150 ${
-                      voiceFilter === filter
-                        ? "border-blue-900 bg-blue-900 text-white"
-                        : "border-stone-200 bg-white text-stone-500 hover:border-blue-300 hover:text-blue-900"
-                    }`}
-                  >
-                    {FILTER_LABELS[filter]}
-                  </button>
-                ))}
+                {availableFilters.map((filter) => {
+                  const on = selectedRoles.includes(filter);
+                  return (
+                    <button
+                      key={filter}
+                      onClick={() => toggleRole(filter)}
+                      aria-pressed={on}
+                      className={`rounded-full border px-4 py-2 text-sm font-bold transition-all duration-150 ${
+                        on
+                          ? "border-blue-900 bg-blue-900 text-white"
+                          : "border-stone-200 bg-white text-stone-500 hover:border-blue-300 hover:text-blue-900"
+                      }`}
+                    >
+                      {FILTER_LABELS[filter]}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
-            {resultUrl && (
-              <div className="flex justify-end border-t border-stone-100 pt-3">
+            <div className="flex flex-wrap items-center justify-end gap-1 border-t border-stone-100 pt-3">
+              <span className="mr-auto text-xs font-bold uppercase tracking-wide text-stone-400">
+                Export
+              </span>
+              {resultUrl && (
                 <a
                   href={resultUrl}
-                  download="score.mxl"
+                  download={`${baseFileName}.mxl`}
                   className="rounded-full px-3 py-1.5 text-xs font-bold text-stone-400 transition-colors hover:bg-stone-100 hover:text-blue-900"
                 >
-                  Download MusicXML ↓
+                  MusicXML ↓
                 </a>
-              </div>
-            )}
+              )}
+              <button
+                onClick={handleExportMidi}
+                className="rounded-full px-3 py-1.5 text-xs font-bold text-stone-400 transition-colors hover:bg-stone-100 hover:text-blue-900"
+              >
+                MIDI ↓
+              </button>
+            </div>
           </section>
         )}
 
@@ -630,10 +795,13 @@ export default function Home() {
               </p>
             </div>
           )}
-          <div
-            ref={containerRef}
-            className="max-h-[70vh] overflow-auto rounded-lg bg-white"
-          />
+          <div className="relative">
+            <div ref={containerRef} className="rounded-lg bg-white" />
+            <div
+              ref={overlayRef}
+              className="pointer-events-none absolute inset-0"
+            />
+          </div>
         </section>
       </main>
     </div>
