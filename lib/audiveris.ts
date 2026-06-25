@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import { promises as fs } from "fs";
+import { promises as fs, existsSync } from "fs";
 import path from "path";
 
 const AUDIVERIS_EXE = path.join(
@@ -8,6 +8,16 @@ const AUDIVERIS_EXE = path.join(
   "audiveris",
   "Audiveris",
   "Audiveris.exe"
+);
+
+// Tesseract language data for Audiveris's OCR (titles, tempo, lyrics). Drop
+// eng.traineddata / kor.traineddata (full tessdata, with the legacy engine
+// Audiveris needs) here; if absent, Audiveris just runs without text OCR.
+const TESSDATA_DIR = path.join(
+  process.cwd(),
+  "tools",
+  "audiveris",
+  "tessdata"
 );
 
 export class AudiverisError extends Error {}
@@ -49,11 +59,25 @@ export function runAudiveris(
   onProgress?: (line: string) => void
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(
-      AUDIVERIS_EXE,
-      ["-batch", "-export", "-output", outputDir, "--", inputPath],
-      { windowsHide: true }
-    );
+    // Enable OCR when the language data is present: point Tesseract at it and
+    // ask for Korean + English (these are Korean/English hymnals). Without the
+    // data, run as before (no text OCR) rather than fail.
+    const hasOcr = existsSync(TESSDATA_DIR);
+    const args = ["-batch", "-export"];
+    if (hasOcr) {
+      args.push(
+        "-option",
+        "org.audiveris.omr.text.Language$Constants.defaultSpecification=kor+eng"
+      );
+    }
+    args.push("-output", outputDir, "--", inputPath);
+
+    const proc = spawn(AUDIVERIS_EXE, args, {
+      windowsHide: true,
+      env: hasOcr
+        ? { ...process.env, TESSDATA_PREFIX: TESSDATA_DIR }
+        : process.env,
+    });
 
     let stderrTail = "";
     proc.stdout?.on("data", (chunk: Buffer) => onProgress?.(chunk.toString()));
