@@ -12,18 +12,31 @@ const AUDIVERIS_EXE = path.join(
 
 export class AudiverisError extends Error {}
 
+/**
+ * Find the largest file with the given suffix under `dir`. Audiveris sometimes
+ * splits one page into several "movement" exports (score.mvt1.mxl, …); the
+ * largest is the most complete, so prefer it over an arbitrary first match.
+ */
 async function findFile(dir: string, suffix: string): Promise<string | null> {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const found = await findFile(fullPath, suffix);
-      if (found) return found;
-    } else if (entry.name.toLowerCase().endsWith(suffix)) {
-      return fullPath;
+  let best: string | null = null;
+  let bestSize = -1;
+  const walk = async (d: string): Promise<void> => {
+    const entries = await fs.readdir(d, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(d, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.name.toLowerCase().endsWith(suffix)) {
+        const { size } = await fs.stat(fullPath);
+        if (size > bestSize) {
+          bestSize = size;
+          best = fullPath;
+        }
+      }
     }
-  }
-  return null;
+  };
+  await walk(dir);
+  return best;
 }
 
 /**
