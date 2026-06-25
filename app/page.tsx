@@ -850,6 +850,23 @@ export default function Home() {
                 }}
               />
             </label>
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-blue-200 bg-white px-5 py-2.5 text-sm font-bold text-blue-900 shadow-sm transition-colors hover:bg-blue-50 active:bg-blue-100">
+              {/* camera icon */}
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden>
+                <path d="M9 3 7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z" />
+              </svg>
+              Take a photo
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files?.length) handleFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+            </label>
             <button
               onClick={handleDemo}
               className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-white px-5 py-2.5 text-sm font-bold text-blue-900 transition-colors hover:bg-blue-50"
