@@ -13,6 +13,77 @@ type Mode = "move" | "nw" | "ne" | "sw" | "se";
 
 const INIT: Box = { x: 0.08, y: 0.08, w: 0.84, h: 0.84 };
 
+interface OcrWord {
+  text: string;
+  confidence: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+}
+
+/**
+ * When a page holds two hymns (common in hymnals), guess the one the user
+ * means and return a box around it. Hymns are headed by a large bold number in
+ * the left margin; we OCR for those, treat their vertical positions as hymn
+ * boundaries, and pick the tallest (most complete) segment — the partial
+ * second hymn at the bottom gets a small segment and is excluded. Returns null
+ * for a single-hymn page (leave the default box) or if OCR finds nothing.
+ */
+async function detectHymnBox(
+  blob: Blob,
+  width: number,
+  height: number
+): Promise<Box | null> {
+  try {
+    const { createWorker } = await import("tesseract.js");
+    const worker = await createWorker("eng");
+    try {
+      const { data } = await worker.recognize(blob, {}, { blocks: true });
+      const words: OcrWord[] = [];
+      for (const b of data.blocks ?? [])
+        for (const p of b.paragraphs ?? [])
+          for (const l of p.lines ?? [])
+            for (const w of l.words ?? []) words.push(w as OcrWord);
+      if (words.length < 10) return null;
+
+      const heights = words
+        .map((w) => w.bbox.y1 - w.bbox.y0)
+        .filter((h) => h > 0)
+        .sort((a, b) => a - b);
+      const medH = heights[Math.floor(heights.length / 2)] || 1;
+
+      const boundaries = words
+        .filter(
+          (w) =>
+            /^\d{3}$/.test(w.text.trim()) &&
+            w.bbox.y1 - w.bbox.y0 > medH * 1.6 && // large (hymn-number sized)
+            w.bbox.x0 < width * 0.35 && // left margin
+            w.confidence > 55
+        )
+        .map((w) => w.bbox.y0 / height)
+        .sort((a, b) => a - b);
+      if (boundaries.length === 0) return null;
+
+      const cuts = [0, ...boundaries, 1];
+      let best: [number, number] = [0, 1];
+      let bestH = -1;
+      for (let i = 0; i < cuts.length - 1; i++) {
+        const h = cuts[i + 1] - cuts[i];
+        if (h > bestH) {
+          bestH = h;
+          best = [cuts[i], cuts[i + 1]];
+        }
+      }
+      const top = Math.max(0, best[0] - 0.005);
+      const bot = best[1] < 1 ? best[1] - 0.012 : 0.99;
+      if (bot - top > 0.9) return null; // no real split — keep the default box
+      return { x: 0.02, y: top, w: 0.96, h: bot - top };
+    } finally {
+      await worker.terminate();
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Full-screen "crop to one hymn" step. The user drags a box around the hymn
  * they actually want (an open-book photo often shows two hymns plus the facing
@@ -30,16 +101,47 @@ export default function CropModal({
 }) {
   const [src, setSrc] = useState("");
   const [box, setBox] = useState<Box>(INIT);
+  const [hint, setHint] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const urlRef = useRef<string>("");
+  const blobRef = useRef<Blob | null>(null);
+  const userMoved = useRef(false);
+  const detected = useRef(false);
   const drag = useRef<{ mode: Mode; px: number; py: number; box: Box } | null>(null);
 
   // Swap in a new object URL for the working image, revoking the old one. Object
   // URLs (not data URLs) keep multi-MB images out of the DOM string.
   const swapSrc = useCallback((blob: Blob) => {
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    blobRef.current = blob;
     urlRef.current = URL.createObjectURL(blob);
     setSrc(urlRef.current);
+  }, []);
+
+  // Once the image is shown, try to auto-select the intended hymn (a two-hymn
+  // page is common). Runs once; never overrides a box the user already touched.
+  // The box stays fully draggable afterwards so the user can fine-tune or redo.
+  const onImgLoad = useCallback(async () => {
+    if (detected.current) return;
+    detected.current = true;
+    const img = imgRef.current;
+    const blob = blobRef.current;
+    if (!img || !blob) return;
+    setBusy(true);
+    setHint("Finding the hymn for you…");
+    const found = await detectHymnBox(blob, img.naturalWidth, img.naturalHeight);
+    setBusy(false);
+    if (userMoved.current) {
+      setHint(null);
+      return;
+    }
+    if (found) {
+      setBox(found);
+      setHint("Auto-selected the main hymn — fine-tune the box, or just recognize.");
+    } else {
+      setHint(null);
+    }
   }, []);
 
   // Decode the file to an EXIF-corrected image so it shows upright.
@@ -111,6 +213,8 @@ export default function CropModal({
   const down = (mode: Mode) => (e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    userMoved.current = true;
+    setHint(null);
     drag.current = { mode, px: e.clientX, py: e.clientY, box };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
@@ -137,6 +241,10 @@ export default function CropModal({
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
     c.toBlob((blob) => blob && swapSrc(blob), "image/jpeg", 0.9);
     setBox(INIT);
+    // Re-run hymn auto-detection on the new orientation.
+    detected.current = false;
+    userMoved.current = false;
+    setHint(null);
   };
 
   const exportRegion = (b: Box) => {
@@ -167,7 +275,12 @@ export default function CropModal({
       aria-modal="true"
     >
       <div className="flex items-center justify-between gap-2 px-4 py-3">
-        <span className="text-sm font-bold text-white">Crop to one hymn</span>
+        <span className="flex items-center gap-2 text-sm font-bold text-white">
+          Crop to one hymn
+          {busy && (
+            <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+          )}
+        </span>
         <button
           onClick={onCancel}
           aria-label="Cancel"
@@ -177,7 +290,7 @@ export default function CropModal({
         </button>
       </div>
       <p className="px-4 text-xs text-stone-300">
-        Drag the box around the hymn you want — only that part is recognized.
+        {hint ?? "Drag the box around the hymn you want — only that part is recognized."}
       </p>
 
       <div className="flex min-h-0 flex-1 items-center justify-center p-3">
@@ -189,6 +302,7 @@ export default function CropModal({
               src={src}
               alt=""
               draggable={false}
+              onLoad={onImgLoad}
               className="block max-h-[64vh] max-w-full select-none"
             />
           )}
