@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import { promises as fs, existsSync } from "fs";
+import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
+import JSZip from "jszip";
 import path from "path";
 
 const AUDIVERIS_EXE = path.join(
@@ -22,14 +24,37 @@ const TESSDATA_DIR = path.join(
 
 export class AudiverisError extends Error {}
 
+export interface MusicXmlQuality {
+  score: number;
+  pitchedNotes: number;
+  partCount: number;
+  measureCount: number;
+  partNoteBalance: number;
+  partDurationBalance: number;
+  hasKeySignature: boolean;
+  hasTimeSignature: boolean;
+}
+
+export function isReliableNoteTranscription(quality: MusicXmlQuality): boolean {
+  return (
+    quality.score >= 480 &&
+    quality.pitchedNotes >= 20 &&
+    quality.partCount >= 1 &&
+    quality.partCount <= 4 &&
+    quality.measureCount >= 4 &&
+    quality.partNoteBalance >= 0.65 &&
+    quality.partDurationBalance >= 0.6 &&
+    quality.hasTimeSignature
+  );
+}
+
 /**
  * Find the largest file with the given suffix under `dir`. Audiveris sometimes
  * splits one page into several "movement" exports (score.mvt1.mxl, …); the
  * largest is the most complete, so prefer it over an arbitrary first match.
  */
-async function findFile(dir: string, suffix: string): Promise<string | null> {
-  let best: string | null = null;
-  let bestSize = -1;
+async function findFiles(dir: string, suffix: string): Promise<string[]> {
+  const matches: Array<{ path: string; size: number }> = [];
   const walk = async (d: string): Promise<void> => {
     const entries = await fs.readdir(d, { withFileTypes: true });
     for (const entry of entries) {
@@ -38,15 +63,193 @@ async function findFile(dir: string, suffix: string): Promise<string | null> {
         await walk(fullPath);
       } else if (entry.name.toLowerCase().endsWith(suffix)) {
         const { size } = await fs.stat(fullPath);
-        if (size > bestSize) {
-          bestSize = size;
-          best = fullPath;
-        }
+        matches.push({ path: fullPath, size });
       }
     }
   };
   await walk(dir);
+  return matches.sort((a, b) => b.size - a.size).map((match) => match.path);
+}
+
+function parsePlayableMusicXml(xml: string, source: string): Document {
+  const errors: string[] = [];
+  const parser = new DOMParser({
+    errorHandler: {
+      warning: (message) => errors.push(message),
+      error: (message) => errors.push(message),
+      fatalError: (message) => errors.push(message),
+    },
+  });
+  const document = parser.parseFromString(xml, "application/xml");
+  const root = document.documentElement?.localName;
+  if (errors.length || (root !== "score-partwise" && root !== "score-timewise")) {
+    throw new AudiverisError(`Invalid MusicXML in ${source}: ${errors[0] ?? "bad root"}`);
+  }
+  if (
+    document.getElementsByTagName("note").length === 0 ||
+    document.getElementsByTagName("duration").length === 0 ||
+    document.getElementsByTagName("pitch").length === 0
+  ) {
+    throw new AudiverisError(`MusicXML in ${source} contains no playable notes`);
+  }
+  return document;
+}
+
+function qualityForDocument(document: Document): MusicXmlQuality {
+  const parts = Array.from(document.getElementsByTagName("part"));
+  const measureCounts: number[] = [];
+  const noteCounts: number[] = [];
+  const durationTotals: number[] = [];
+
+  for (const part of parts) {
+    measureCounts.push(part.getElementsByTagName("measure").length);
+    const pitched = Array.from(part.getElementsByTagName("note")).filter(
+      (note) => note.getElementsByTagName("pitch").length > 0
+    );
+    noteCounts.push(pitched.length);
+    durationTotals.push(
+      pitched.reduce((sum, note) => {
+        const value = Number(note.getElementsByTagName("duration")[0]?.textContent ?? 0);
+        return sum + (Number.isFinite(value) ? value : 0);
+      }, 0)
+    );
+  }
+
+  const pitchedNotes = noteCounts.reduce((sum, value) => sum + value, 0);
+  const measureCount = Math.max(0, ...measureCounts);
+  const partCount = parts.length;
+  const balanceRatio = (values: number[]): number => {
+    if (values.length <= 1) return 1;
+    const maximum = Math.max(...values);
+    return maximum > 0 ? Math.min(...values) / maximum : 0;
+  };
+  const partNoteBalance = balanceRatio(noteCounts);
+  const partDurationBalance = balanceRatio(durationTotals);
+  const hasKeySignature = document.getElementsByTagName("fifths").length > 0;
+  const hasTimeSignature =
+    document.getElementsByTagName("beats").length > 0 &&
+    document.getElementsByTagName("beat-type").length > 0;
+  const score =
+    Math.min(pitchedNotes, 300) +
+    Math.min(measureCount, 30) * 2 +
+    (partCount >= 1 && partCount <= 4
+      ? 50
+      : Math.max(0, 50 - Math.abs(partCount - 2) * 15)) +
+    balanceRatio(measureCounts) * 100 +
+    partNoteBalance * 100 +
+    partDurationBalance * 80 +
+    (hasKeySignature ? 30 : 0) +
+    (hasTimeSignature ? 60 : 0);
+
+  return {
+    score,
+    pitchedNotes,
+    partCount,
+    measureCount,
+    partNoteBalance,
+    partDurationBalance,
+    hasKeySignature,
+    hasTimeSignature,
+  };
+}
+
+export async function scoreMusicXmlArchive(mxlPath: string): Promise<MusicXmlQuality> {
+  const zip = await JSZip.loadAsync(await fs.readFile(mxlPath));
+  let best: MusicXmlQuality | null = null;
+  for (const [name, entry] of Object.entries(zip.files)) {
+    const lowerName = name.toLowerCase().replaceAll("\\", "/");
+    if (
+      entry.dir ||
+      lowerName === "meta-inf/container.xml" ||
+      !(lowerName.endsWith(".xml") || lowerName.endsWith(".musicxml"))
+    ) {
+      continue;
+    }
+    const document = parsePlayableMusicXml(await entry.async("string"), name);
+    const quality = qualityForDocument(document);
+    if (!best || quality.score > best.score) best = quality;
+  }
+  if (!best) throw new AudiverisError("MusicXML archive contains no score document");
   return best;
+}
+
+/** Remove sung lyrics with an XML parser, then validate the playable archive. */
+export async function prepareMusicXmlArchive(
+  mxlPath: string,
+  removeLyrics: boolean
+): Promise<void> {
+  const zip = await JSZip.loadAsync(await fs.readFile(mxlPath));
+  let changed = false;
+  let scoreCount = 0;
+
+  for (const [name, entry] of Object.entries(zip.files)) {
+    const lowerName = name.toLowerCase().replaceAll("\\", "/");
+    if (entry.dir || !(lowerName.endsWith(".xml") || lowerName.endsWith(".musicxml"))) {
+      continue;
+    }
+    if (lowerName === "meta-inf/container.xml") continue;
+
+    const xml = await entry.async("string");
+    const document = parsePlayableMusicXml(xml, name);
+    scoreCount++;
+    if (removeLyrics) {
+      const lyrics = Array.from(document.getElementsByTagName("lyric"));
+      for (const lyric of lyrics) lyric.parentNode?.removeChild(lyric);
+      if (lyrics.length > 0) {
+        const cleanedXml = new XMLSerializer().serializeToString(document);
+        parsePlayableMusicXml(cleanedXml, `${name} after lyric removal`);
+        zip.file(name, cleanedXml);
+        changed = true;
+      }
+    }
+  }
+
+  if (scoreCount === 0) {
+    throw new AudiverisError("MusicXML archive contains no score document");
+  }
+
+  if (changed) {
+    const cleaned = await zip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+    });
+    // Validate the exact bytes that will be served before replacing the file.
+    const checkZip = await JSZip.loadAsync(cleaned);
+    for (const [name, entry] of Object.entries(checkZip.files)) {
+      const lowerName = name.toLowerCase().replaceAll("\\", "/");
+      if (
+        !entry.dir &&
+        lowerName !== "meta-inf/container.xml" &&
+        (lowerName.endsWith(".xml") || lowerName.endsWith(".musicxml"))
+      ) {
+        parsePlayableMusicXml(await entry.async("string"), name);
+      }
+    }
+    await fs.writeFile(mxlPath, cleaned);
+  }
+}
+
+async function selectValidExport(
+  outputDir: string,
+  removeLyrics: boolean
+): Promise<string> {
+  const candidates = await findFiles(outputDir, ".mxl");
+  let lastError: unknown;
+  const valid: Array<{ path: string; quality: MusicXmlQuality }> = [];
+  for (const candidate of candidates) {
+    try {
+      await prepareMusicXmlArchive(candidate, removeLyrics);
+      valid.push({ path: candidate, quality: await scoreMusicXmlArchive(candidate) });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (valid.length > 0) {
+    valid.sort((a, b) => b.quality.score - a.quality.score);
+    return valid[0].path;
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new AudiverisError("Audiveris did not produce a valid .mxl output file");
 }
 
 /**
@@ -59,6 +262,8 @@ export function runAudiveris(
   onProgress?: (line: string) => void
 ): Promise<string> {
   return new Promise((resolve, reject) => {
+    const isPhoto = /\.(?:avif|gif|jpe?g|png|tiff?|webp)$/i.test(inputPath);
+
     // Enable OCR when the language data is present: point Tesseract at it and
     // ask for Korean + English (these are Korean/English hymnals). Without the
     // data, run as before (no text OCR) rather than fail.
@@ -66,10 +271,19 @@ export function runAudiveris(
     const args = ["-batch", "-export"];
     if (hasOcr) {
       args.push(
-        "-option",
+        "-constant",
         "org.audiveris.omr.text.Language$Constants.defaultSpecification=kor+eng"
       );
     }
+    args.push(
+      "-constant",
+      "org.audiveris.omr.sheet.ProcessingSwitches$Constants.lyrics=false",
+      "-constant",
+      "org.audiveris.omr.sheet.ProcessingSwitches$Constants.chordNames=false",
+      "-constant",
+      "org.audiveris.omr.sheet.ProcessingSwitches$Constants.articulations=false"
+    );
+
     args.push("-output", outputDir, "--", inputPath);
 
     const proc = spawn(AUDIVERIS_EXE, args, {
@@ -79,34 +293,32 @@ export function runAudiveris(
         : process.env,
     });
 
-    let stderrTail = "";
-    proc.stdout?.on("data", (chunk: Buffer) => onProgress?.(chunk.toString()));
-    proc.stderr?.on("data", (chunk: Buffer) => {
+    let outputTail = "";
+    const capture = (chunk: Buffer) => {
       const text = chunk.toString();
-      stderrTail = (stderrTail + text).slice(-2000);
+      outputTail = (outputTail + text).slice(-4000);
       onProgress?.(text);
-    });
+    };
+    proc.stdout?.on("data", capture);
+    proc.stderr?.on("data", capture);
 
     proc.on("error", (err) => {
       reject(new AudiverisError(`Failed to start Audiveris: ${err.message}`));
     });
 
     proc.on("close", async (code) => {
-      if (code !== 0) {
-        reject(
-          new AudiverisError(`Audiveris exited with code ${code}: ${stderrTail}`)
-        );
-        return;
-      }
       try {
-        const mxl = await findFile(outputDir, ".mxl");
-        if (!mxl) {
-          reject(new AudiverisError("Audiveris did not produce a .mxl output file"));
-          return;
-        }
-        resolve(mxl);
+        // Some Audiveris books contain one broken movement but still export a
+        // valid sibling score before exiting nonzero. Validate candidates
+        // instead of discarding usable work based only on the process code.
+        resolve(await selectValidExport(outputDir, isPhoto));
       } catch (err) {
-        reject(err);
+        const detail = err instanceof Error ? err.message : String(err);
+        reject(
+          new AudiverisError(
+            `Audiveris exited with code ${code ?? "unknown"}: ${detail}\n${outputTail}`.trim()
+          )
+        );
       }
     });
   });

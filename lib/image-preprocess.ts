@@ -125,9 +125,14 @@ async function detectPageCrop(oriented: Buffer): Promise<sharp.Region | null> {
  *
  * Returns a PNG buffer, or null if preprocessing fails (caller keeps original).
  */
-export async function preprocessImage(
+export interface PreprocessedImage {
+  label: string;
+  buffer: Buffer;
+}
+
+export async function preprocessImageVariants(
   input: Uint8Array
-): Promise<Buffer | null> {
+): Promise<PreprocessedImage[]> {
   try {
     const orientedBuf = await sharp(input, { failOn: "none" }).rotate().toBuffer();
 
@@ -136,21 +141,21 @@ export async function preprocessImage(
     if (crop) base = base.extract(crop);
 
     // Cap size (and upscale small shots) so CLAHE tiles are a sane scale.
-    const gray = await base
+    const noteGray = await base
       .grayscale()
-      .resize({ width: 2000, height: 2600, fit: "inside", withoutEnlargement: false })
+      .resize({ width: 3000, height: 3900, fit: "inside", withoutEnlargement: false })
+      .sharpen({ sigma: 0.7, m1: 0.35, m2: 0.7 })
       .png()
       .toBuffer();
 
     // CLAHE and sharpen must be separate libvips passes — chaining them on a
     // grayscale image trips a "must be UCHAR" error.
-    const equalized = await sharp(gray)
-      .clahe({ width: 180, height: 180, maxSlope: 3 })
-      .png()
-      .toBuffer();
-
-    return await sharp(equalized).sharpen().png().toBuffer();
+    return [{ label: "note-preserving grayscale", buffer: noteGray }];
   } catch {
-    return null;
+    return [];
   }
+}
+
+export async function preprocessImage(input: Uint8Array): Promise<Buffer | null> {
+  return (await preprocessImageVariants(input))[0]?.buffer ?? null;
 }

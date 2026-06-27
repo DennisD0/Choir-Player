@@ -6,9 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test --experimental-strip-types lib/hymn-crop.test.ts lib/audiveris.test.ts lib/hymn-presets.test.ts"
   },
   "dependencies": {
+    "@xmldom/xmldom": "^0.8.13",
+    "jszip": "^3.10.1",
     "next": "16.2.9",
     "opensheetmusicdisplay": "^1.9.9",
     "pdfjs-dist": "^6.0.227",

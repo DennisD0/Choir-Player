@@ -233,7 +233,7 @@ export default function Home() {
    * Draw blue boxes over the selected parts' staves for the current measure,
    * and tint the notes inside those staves red. Reverts the previous notes.
    */
-  const drawHighlights = useCallback((autoScroll = false) => {
+  const drawHighlights = useCallback(() => {
     const overlay = overlayRef.current;
     if (!overlay) return;
 
@@ -250,7 +250,6 @@ export default function Home() {
     const measureIndex = currentMeasureRef.current;
     const row = measureRectsRef.current[measureIndex];
     const fragment = document.createDocumentFragment();
-    let firstBox: HTMLDivElement | null = null;
     if (row) {
       for (const staff of staffIndices) {
         const rect = row[staff];
@@ -261,7 +260,6 @@ export default function Home() {
           `width:${rect.w}px;height:${rect.h}px;background:${HIGHLIGHT_FILL};` +
           `border:1.5px solid ${HIGHLIGHT_BORDER};border-radius:6px;` +
           `box-sizing:border-box;pointer-events:none;`;
-        if (!firstBox) firstBox = box;
         fragment.appendChild(box);
       }
     }
@@ -296,9 +294,6 @@ export default function Home() {
       }
     }
 
-    if (autoScroll) {
-      firstBox?.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
   }, []);
 
   /**
@@ -328,12 +323,14 @@ export default function Home() {
       }
       currentMeasureRef.current = measure;
       currentOnsetRef.current = onset;
-      drawHighlights(true);
+      // Highlight the current notes without moving the viewport. Users may be
+      // reading another system or reaching controls while playback continues.
+      drawHighlights();
     },
     [drawHighlights]
   );
 
-  const tick = useCallback(() => {
+  const tick = useCallback(function animationTick() {
     const engine = engineRef.current;
     if (!engine) return;
 
@@ -352,7 +349,7 @@ export default function Home() {
       cancelLoop();
       return;
     }
-    rafRef.current = requestAnimationFrame(tick);
+    rafRef.current = requestAnimationFrame(animationTick);
   }, [syncHighlight, drawHighlights, cancelLoop]);
 
   const loadScore = useCallback(async (
@@ -837,6 +834,7 @@ export default function Home() {
     () => songs.find((s) => s.id === activeSongId) ?? null,
     [songs, activeSongId]
   );
+  const playerTitle = fileName ?? activeSong?.name ?? "Score";
 
   // Only the player blocks on loading now; uploads/OMR run in the background,
   // so the upload control stays available the whole time.
@@ -865,7 +863,11 @@ export default function Home() {
         </div>
       </header>
 
-      <main className="flex-1 w-full max-w-3xl mx-auto px-4 py-6 flex flex-col gap-5">
+      <main
+        className={`flex-1 w-full max-w-3xl mx-auto px-4 py-6 flex flex-col gap-5 ${
+          stage === "ready" ? "pb-44 sm:pb-40" : ""
+        }`}
+      >
         {/* Upload */}
         <section className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2.5">
@@ -1010,7 +1012,7 @@ export default function Home() {
           <section className="rounded-2xl border border-stone-100 bg-white p-4 sm:p-5 shadow-sm flex flex-col gap-5">
             {/* Now-playing title */}
             <p className="truncate text-sm font-black text-blue-900">
-              {fileName ?? activeSong?.name ?? "Score"}
+              {playerTitle}
             </p>
             {/* Transport row */}
             <div className="flex flex-wrap items-center gap-3">
@@ -1152,6 +1154,86 @@ export default function Home() {
           </div>
         </section>
       </main>
+
+      {stage === "ready" && (
+        <aside
+          className="fixed inset-x-0 bottom-0 z-40 px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]"
+          aria-label="Music player"
+        >
+          <div className="mx-auto max-w-3xl overflow-hidden rounded-2xl border border-blue-100 bg-white/95 shadow-[0_-10px_35px_rgba(15,23,42,0.18)] backdrop-blur-xl">
+            <div className="flex items-center gap-3 px-4 pt-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-blue-400">
+                  Now playing
+                </p>
+                <p className="truncate text-sm font-black text-blue-950">
+                  {playerTitle}
+                </p>
+              </div>
+              <span className="shrink-0 text-xs font-semibold tabular-nums text-stone-400">
+                {formatTime(positionSec)} / {formatTime(durationSec)}
+              </span>
+            </div>
+
+            <input
+              type="range"
+              min={0}
+              max={durationSec || 0}
+              step={0.05}
+              value={Math.min(positionSec, durationSec)}
+              onChange={(event) => handleSeek(Number(event.target.value))}
+              className="mx-4 mt-2 block w-[calc(100%_-_2rem)] accent-blue-900"
+              aria-label="Playback position"
+            />
+
+            <div className="flex items-center justify-center gap-3 px-4 pb-3 pt-2">
+              <button
+                type="button"
+                onClick={() => handleSeek(Math.max(0, positionSec - 10))}
+                aria-label="Back 10 seconds"
+                className="flex h-10 w-10 items-center justify-center rounded-full text-blue-900 transition-colors hover:bg-blue-50 active:bg-blue-100"
+              >
+                <span className="text-xs font-black" aria-hidden>−10</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={isPlaying ? handlePause : handlePlay}
+                aria-label={isPlaying ? "Pause" : "Play"}
+                className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-900 text-white shadow-md transition-colors hover:bg-blue-800 active:bg-blue-950"
+              >
+                {isPlaying ? (
+                  <svg viewBox="0 0 24 24" className="h-6 w-6" fill="currentColor" aria-hidden>
+                    <path d="M7 5.5A1.5 1.5 0 0 1 8.5 4h1A1.5 1.5 0 0 1 11 5.5v13A1.5 1.5 0 0 1 9.5 20h-1A1.5 1.5 0 0 1 7 18.5v-13Zm6 0A1.5 1.5 0 0 1 14.5 4h1A1.5 1.5 0 0 1 17 5.5v13a1.5 1.5 0 0 1-1.5 1.5h-1a1.5 1.5 0 0 1-1.5-1.5v-13Z" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" className="ml-0.5 h-6 w-6" fill="currentColor" aria-hidden>
+                    <path d="M7.5 5.2a1.3 1.3 0 0 1 2-.98l9.2 6.8a1.2 1.2 0 0 1 0 1.96l-9.2 6.8a1.3 1.3 0 0 1-2-.98V5.2Z" />
+                  </svg>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleSeek(Math.min(durationSec, positionSec + 10))}
+                aria-label="Forward 10 seconds"
+                className="flex h-10 w-10 items-center justify-center rounded-full text-blue-900 transition-colors hover:bg-blue-50 active:bg-blue-100"
+              >
+                <span className="text-xs font-black" aria-hidden>+10</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStop}
+                aria-label="Stop"
+                className="ml-2 flex h-10 w-10 items-center justify-center rounded-full text-stone-500 transition-colors hover:bg-stone-100 active:bg-stone-200"
+              >
+                <span className="h-3.5 w-3.5 rounded-[3px] bg-current" aria-hidden />
+              </button>
+            </div>
+          </div>
+        </aside>
+      )}
 
       {cropQueue.length > 0 && (
         <CropModal

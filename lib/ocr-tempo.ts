@@ -93,6 +93,13 @@ export function parseTempo(text: string): number | null {
     candidates.push(+m[1]);
   }
 
+  // On shadowed phone photos, Tesseract often turns "♩. =" into a compact
+  // token such as "Ad" and drops the separator entirely (for example
+  // "Ad 44"). Keep this narrow so hymn numbers and years are not candidates.
+  for (const m of norm.matchAll(/\b(?:A?d|J|o|q)\b\s*[.=: -]*\s*(\d{2,3})(?!\d)/gi)) {
+    candidates.push(+m[1]);
+  }
+
   // A tempo word followed by a number.
   const word =
     /(freely|andante|andantino|allegretto|allegro|moderato|adagio|larghetto|largo|vivace|lento|grave|presto)\D{0,12}(\d{2,3})(?!\d)/i;
@@ -137,4 +144,3 @@ export async function extractTempoFromFile(file: File): Promise<number | null> {
     return null;
   }
 }
-

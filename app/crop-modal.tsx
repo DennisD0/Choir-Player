@@ -1,23 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  detectHymnSelectionFromWords,
+  type HymnCropBox,
+  type HymnCropSelection,
+  type HymnOcrWord,
+} from "@/lib/hymn-crop";
 
-interface Box {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-} // all fractions of the displayed image, 0..1
+type Box = HymnCropBox; // all fractions of the displayed image, 0..1
 
 type Mode = "move" | "nw" | "ne" | "sw" | "se";
 
 const INIT: Box = { x: 0.08, y: 0.08, w: 0.84, h: 0.84 };
-
-interface OcrWord {
-  text: string;
-  confidence: number;
-  bbox: { x0: number; y0: number; x1: number; y1: number };
-}
 
 /**
  * When a page holds two hymns (common in hymnals), guess the one the user
@@ -31,51 +26,19 @@ async function detectHymnBox(
   blob: Blob,
   width: number,
   height: number
-): Promise<Box | null> {
+): Promise<HymnCropSelection | null> {
   try {
     const { createWorker } = await import("tesseract.js");
     const worker = await createWorker("eng");
     try {
       const { data } = await worker.recognize(blob, {}, { blocks: true });
-      const words: OcrWord[] = [];
+      const words: HymnOcrWord[] = [];
       for (const b of data.blocks ?? [])
         for (const p of b.paragraphs ?? [])
           for (const l of p.lines ?? [])
-            for (const w of l.words ?? []) words.push(w as OcrWord);
-      if (words.length < 10) return null;
+            for (const w of l.words ?? []) words.push(w as HymnOcrWord);
+      return detectHymnSelectionFromWords(words, width, height);
 
-      const heights = words
-        .map((w) => w.bbox.y1 - w.bbox.y0)
-        .filter((h) => h > 0)
-        .sort((a, b) => a - b);
-      const medH = heights[Math.floor(heights.length / 2)] || 1;
-
-      const boundaries = words
-        .filter(
-          (w) =>
-            /^\d{3}$/.test(w.text.trim()) &&
-            w.bbox.y1 - w.bbox.y0 > medH * 1.6 && // large (hymn-number sized)
-            w.bbox.x0 < width * 0.35 && // left margin
-            w.confidence > 55
-        )
-        .map((w) => w.bbox.y0 / height)
-        .sort((a, b) => a - b);
-      if (boundaries.length === 0) return null;
-
-      const cuts = [0, ...boundaries, 1];
-      let best: [number, number] = [0, 1];
-      let bestH = -1;
-      for (let i = 0; i < cuts.length - 1; i++) {
-        const h = cuts[i + 1] - cuts[i];
-        if (h > bestH) {
-          bestH = h;
-          best = [cuts[i], cuts[i + 1]];
-        }
-      }
-      const top = Math.max(0, best[0] - 0.005);
-      const bot = best[1] < 1 ? best[1] - 0.012 : 0.99;
-      if (bot - top > 0.9) return null; // no real split — keep the default box
-      return { x: 0.02, y: top, w: 0.96, h: bot - top };
     } finally {
       await worker.terminate();
     }
@@ -103,6 +66,7 @@ export default function CropModal({
   const [box, setBox] = useState<Box>(INIT);
   const [hint, setHint] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hymnNumber, setHymnNumber] = useState<string | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const urlRef = useRef<string>("");
   const blobRef = useRef<Blob | null>(null);
@@ -137,7 +101,8 @@ export default function CropModal({
       return;
     }
     if (found) {
-      setBox(found);
+      setBox(found.box);
+      setHymnNumber(found.hymnNumber);
       setHint("Auto-selected the main hymn — fine-tune the box, or just recognize.");
     } else {
       setHint(null);
@@ -204,21 +169,24 @@ export default function CropModal({
     setBox({ x, y, w, h });
   }, []);
 
-  const up = useCallback(() => {
+  const up = useCallback(function pointerUp() {
     drag.current = null;
     window.removeEventListener("pointermove", move);
-    window.removeEventListener("pointerup", up);
+    window.removeEventListener("pointerup", pointerUp);
   }, [move]);
 
-  const down = (mode: Mode) => (e: React.PointerEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    userMoved.current = true;
-    setHint(null);
-    drag.current = { mode, px: e.clientX, py: e.clientY, box };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  };
+  const down = useCallback(
+    (mode: Mode, e: React.PointerEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      userMoved.current = true;
+      setHint(null);
+      drag.current = { mode, px: e.clientX, py: e.clientY, box };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+    },
+    [box, move, up]
+  );
 
   useEffect(
     () => () => {
@@ -241,6 +209,7 @@ export default function CropModal({
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
     c.toBlob((blob) => blob && swapSrc(blob), "image/jpeg", 0.9);
     setBox(INIT);
+    setHymnNumber(null);
     // Re-run hymn auto-detection on the new orientation.
     detected.current = false;
     userMoved.current = false;
@@ -261,7 +230,10 @@ export default function CropModal({
     const base = file.name.replace(/\.[^.]+$/, "");
     c.toBlob(
       (blob) => {
-        if (blob) onConfirm(new File([blob], `${base}.jpg`, { type: "image/jpeg" }));
+        if (blob) {
+          const prefix = hymnNumber ? `${hymnNumber}-` : "";
+          onConfirm(new File([blob], `${prefix}${base}.jpg`, { type: "image/jpeg" }));
+        }
       },
       "image/jpeg",
       0.92
@@ -316,12 +288,12 @@ export default function CropModal({
                 height: `${box.h * 100}%`,
                 cursor: "move",
               }}
-              onPointerDown={down("move")}
+              onPointerDown={(event) => down("move", event)}
             >
               {(["nw", "ne", "sw", "se"] as Mode[]).map((m) => (
                 <span
                   key={m}
-                  onPointerDown={down(m)}
+                  onPointerDown={(event) => down(m, event)}
                   className="absolute h-5 w-5 rounded-full border-2 border-white bg-blue-500 shadow"
                   style={{
                     left: m.includes("w") ? -10 : "auto",
