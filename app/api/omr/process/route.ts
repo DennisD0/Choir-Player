@@ -165,6 +165,10 @@ async function processJob(
       const quality = await scoreMusicXmlArchive(resultPath);
       if (isReliableNoteTranscription(quality)) {
         results.push({ path: resultPath, label: attempt.label, score: quality.score });
+        // The first attempt is the cleaned-up image, which is the best input.
+        // If it already yields reliable notation, skip the slower fallback
+        // pass(es) — each one is a full multi-minute OMR run on dense pages.
+        break;
       } else {
         errors.push(
           `${attempt.label}: incomplete note transcription ` +

@@ -26,7 +26,11 @@ const AUDIVERIS_JAVA_ARGS = [
 ];
 
 const STARTUP_TIMEOUT_MS = 30_000;
-const INACTIVITY_TIMEOUT_MS = 5 * 60_000;
+// Dense full-page hymnals (4 voices + bilingual lyrics) have a heavy OCR/TEXTS
+// step that can run several minutes without emitting a log line on a 2-vCPU
+// cloud instance. Keep the stall guard generous so a slow-but-working step
+// isn't mistaken for a hang and killed.
+const INACTIVITY_TIMEOUT_MS = 8 * 60_000;
 
 // Tesseract language data for Audiveris's OCR (titles, tempo, lyrics). Drop
 // eng.traineddata / kor.traineddata (full tessdata, with the legacy engine
