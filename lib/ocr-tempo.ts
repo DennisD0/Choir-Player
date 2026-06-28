@@ -112,35 +112,98 @@ export function parseTempo(text: string): number | null {
   return null;
 }
 
-/** OCR a scanned score and return its tempo in BPM, or null if not found. */
-export async function extractTempoFromFile(file: File): Promise<number | null> {
+/**
+ * Pull the hymn's printed title out of OCR'd header text. Hymnal/app
+ * screenshots print a clear English title line (e.g. "Be not Dismayed
+ * Whate'er Betide"); pick the most title-like line and skip the noise around it
+ * — phone nav bars ("Hymn 432"), tune codes ("GOD CARE: 8.6.8.6."), and
+ * composer credits ("W.S. Martin 1904").
+ */
+export function parseTitle(text: string): string | null {
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const raw of text.split(/\n/)) {
+    const line = raw.trim().replace(/\s+/g, " ");
+    if (line.length < 6 || line.length > 70) continue;
+    if (/\d{4}/.test(line)) continue; // composer credit years
+    if (/^hymn\b/i.test(line)) continue; // app nav bar
+    const letters = line.match(/[A-Za-z]/g)?.length ?? 0;
+    const upper = line.match(/[A-Z]/g)?.length ?? 0;
+    const words = line.split(" ").filter((w) => /[A-Za-z]{2,}/.test(w));
+    if (words.length < 2 || letters < 6) continue;
+    if (letters / line.length < 0.55) continue; // mostly letters, not a code
+    if (upper / letters > 0.6) continue; // ALL-CAPS tune names / section codes
+    if (letters > bestScore) {
+      bestScore = letters;
+      best = line.replace(/^[^A-Za-z]+/, "").replace(/[^A-Za-z.'!?]+$/, "");
+    }
+  }
+  return best || null;
+}
+
+/** Find the hymn number — "Hymn 432" in an app's nav bar, or the bold standalone
+ *  number printed beside the title. Excludes a value matching the tempo. */
+export function parseHymnNumber(text: string, tempo: number | null): string | null {
+  const nav = text.match(/\bHymn\s*0*(\d{1,3})\b/i);
+  if (nav) return nav[1];
+  for (const raw of text.split(/\n/)) {
+    const t = raw.trim();
+    const m = t.match(/^0*(\d{2,3})\b/);
+    if (m && Number(m[1]) !== tempo) return m[1];
+  }
+  return null;
+}
+
+export type ScoreMeta = {
+  title: string | null;
+  tempo: number | null;
+  hymnNumber: string | null;
+};
+
+/**
+ * OCR a score's header region for everything printed there: title, tempo, and
+ * hymn number. Clean app screenshots read reliably; camera photos degrade
+ * gracefully (each field independently falls back to null). Never throws.
+ */
+export async function extractScoreMeta(file: File): Promise<ScoreMeta> {
+  const empty: ScoreMeta = { title: null, tempo: null, hymnNumber: null };
   try {
     const full = await rasterizeFirstPage(file);
-    if (!full) return null;
-    const region = binarize(cropTop(full, 0.3));
+    if (!full) return empty;
+    const region = binarize(cropTop(full, 0.4));
 
     const { createWorker } = await import("tesseract.js");
     const worker = await createWorker("eng");
     try {
-      // Digit-focused sparse pass first — most reliable for stylized metronome
-      // marks; fall back to a normal sparse pass.
+      // Pass A — full-text, line-preserving (psm 4, single column): reads the
+      // title words and usually the tempo too.
       await worker.setParameters({
-        tessedit_pageseg_mode: "11" as never,
-        tessedit_char_whitelist: "0123456789=♩♪.Jdoq ",
+        tessedit_pageseg_mode: "4" as never,
+        tessedit_char_whitelist: "",
       });
-      let bpm = parseTempo((await worker.recognize(region)).data.text);
-      if (bpm == null) {
+      const text = (await worker.recognize(region)).data.text;
+      let tempo = parseTempo(text);
+      const title = parseTitle(text);
+
+      // Pass B — digit-focused sparse fallback for stylized metronome marks.
+      if (tempo == null) {
         await worker.setParameters({
           tessedit_pageseg_mode: "11" as never,
-          tessedit_char_whitelist: "",
+          tessedit_char_whitelist: "0123456789=♩♪.Jdoq ",
         });
-        bpm = parseTempo((await worker.recognize(region)).data.text);
+        tempo = parseTempo((await worker.recognize(region)).data.text);
       }
-      return bpm;
+
+      return { title, tempo, hymnNumber: parseHymnNumber(text, tempo) };
     } finally {
       await worker.terminate();
     }
   } catch {
-    return null;
+    return empty;
   }
+}
+
+/** OCR a scanned score and return its tempo in BPM, or null if not found. */
+export async function extractTempoFromFile(file: File): Promise<number | null> {
+  return (await extractScoreMeta(file)).tempo;
 }

@@ -322,11 +322,25 @@ export default function Home() {
     const top = Math.min(...rects.map((rect) => rect.y));
     const bottom = Math.max(...rects.map((rect) => rect.y + rect.h));
     const containerBox = container.getBoundingClientRect();
-    const measureCenter = containerBox.top + (top + bottom) / 2;
+    // Active measure band, in viewport coordinates.
+    const measureTop = containerBox.top + top;
+    const measureBottom = containerBox.top + bottom;
+    const measureCenter = (measureTop + measureBottom) / 2;
+
+    // The usable band sits between the sticky header and the fixed player so the
+    // active system never hides behind either chrome.
     const viewportTop = (headerRef.current?.getBoundingClientRect().bottom ?? 0) + 12;
     const viewportBottom =
       (playerRef.current?.getBoundingClientRect().top ?? window.innerHeight) - 12;
     if (viewportBottom <= viewportTop) return;
+
+    // Only scroll when the active measure has drifted out of a comfort band; the
+    // score otherwise jiggles on every measure boundary now that the player
+    // occupies the lower screen. Keep it inside the middle ~60% of the band.
+    const inset = (viewportBottom - viewportTop) * 0.2;
+    const comfortTop = viewportTop + inset;
+    const comfortBottom = viewportBottom - inset;
+    if (measureTop >= comfortTop && measureBottom <= comfortBottom) return;
 
     const targetCenter = (viewportTop + viewportBottom) / 2;
     window.scrollBy({ top: measureCenter - targetCenter, behavior: "smooth" });
@@ -592,12 +606,22 @@ export default function Home() {
         return;
       }
 
-      // OMR drops the printed tempo, so OCR the scan for it in parallel (the
-      // printed tempo lives only in the image). Best-effort; never blocks.
+      // OMR drops the printed tempo and never reads the title reliably, so OCR
+      // the header in parallel. Screenshots/scans print both clearly; we use the
+      // OCR'd title as the song name (beating a meaningless "IMG_1234" filename)
+      // and the OCR'd tempo for playback. Best-effort; never blocks.
       import("@/lib/ocr-tempo")
-        .then(({ extractTempoFromFile }) => extractTempoFromFile(file))
-        .then((bpm) => {
-          if (bpm) updateSong(songId, { ocrTempo: bpm });
+        .then(({ extractScoreMeta }) => extractScoreMeta(file))
+        .then((meta) => {
+          const patch: Partial<Song> = {};
+          if (meta.tempo) patch.ocrTempo = meta.tempo;
+          const generic = /^(img|image|photo|screenshot|scan|untitled|document)[\s_-]*\d*$/i;
+          const base = cleanTitle(file.name);
+          if (meta.title) patch.name = meta.title;
+          else if (meta.hymnNumber && generic.test(base)) {
+            patch.name = `Hymn ${meta.hymnNumber}`;
+          }
+          if (Object.keys(patch).length) updateSong(songId, patch);
         })
         .catch(() => {});
 
