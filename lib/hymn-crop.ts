@@ -22,6 +22,48 @@ function hymnNumber(word: HymnOcrWord): string | null {
   return word.text.trim().match(/(?:^|\D)(\d{3})(?:\D|$)/)?.[1] ?? null;
 }
 
+/**
+ * Find the prominent hymn-number heading on a single-hymn page. Unlike
+ * detectHymnSelectionFromWords — which is tuned to *split* a two-hymn open-book
+ * page and deliberately bails on a lone heading near the top — this just
+ * identifies the one large 3-digit number in the upper-left so the score can be
+ * matched to a verified preset even when no cropping is needed. Returns the
+ * number string, or null if no confident heading is found.
+ */
+export function detectHymnNumberFromWords(
+  words: HymnOcrWord[],
+  width: number,
+  height: number
+): string | null {
+  if (words.length < 5 || width <= 0 || height <= 0) return null;
+
+  const heights = words
+    .map((word) => word.bbox.y1 - word.bbox.y0)
+    .filter((value) => value > 0)
+    .sort((a, b) => a - b);
+  const medianHeight = heights[Math.floor(heights.length / 2)] || 1;
+
+  // A hymn number is a large 3-digit heading set in the upper-left margin. Keep
+  // the geometry strict (so body text / page numbers don't qualify) but allow a
+  // single one — the whole point is the single-hymn case the splitter rejects.
+  const candidates = words
+    .map((word) => ({ word, number: hymnNumber(word) }))
+    .filter(
+      ({ word, number }) =>
+        number !== null &&
+        word.bbox.y1 - word.bbox.y0 > medianHeight * 1.4 &&
+        word.bbox.x0 < width * 0.4 &&
+        word.bbox.y0 < height * 0.5 &&
+        word.confidence > 30
+    )
+    .sort(
+      (a, b) =>
+        b.word.bbox.y1 - b.word.bbox.y0 - (a.word.bbox.y1 - a.word.bbox.y0)
+    );
+
+  return candidates[0]?.number ?? null;
+}
+
 /** Select the largest complete hymn segment inferred from OCR words. */
 export function detectHymnSelectionFromWords(
   words: HymnOcrWord[],

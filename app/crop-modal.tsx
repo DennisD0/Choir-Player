@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  detectHymnNumberFromWords,
   detectHymnSelectionFromWords,
   type HymnCropBox,
-  type HymnCropSelection,
   type HymnOcrWord,
 } from "@/lib/hymn-crop";
 
@@ -39,7 +39,7 @@ async function detectHymnBox(
   blob: Blob,
   width: number,
   height: number
-): Promise<HymnCropSelection | null> {
+): Promise<{ box: HymnCropBox | null; hymnNumber: string | null } | null> {
   try {
     const { createWorker } = await import("tesseract.js");
     const worker = await createWorker("eng");
@@ -50,8 +50,15 @@ async function detectHymnBox(
         for (const p of b.paragraphs ?? [])
           for (const l of p.lines ?? [])
             for (const w of l.words ?? []) words.push(w as HymnOcrWord);
-      return detectHymnSelectionFromWords(words, width, height);
 
+      // A two-hymn page yields a crop selection (box + number). A single-hymn
+      // page doesn't need cropping, but we still want its number so the score
+      // can be matched to a verified preset — box null means "keep the default".
+      const selection = detectHymnSelectionFromWords(words, width, height);
+      if (selection) return selection;
+      const hymnNumber = detectHymnNumberFromWords(words, width, height);
+      if (hymnNumber) return { box: null, hymnNumber };
+      return null;
     } finally {
       await worker.terminate();
     }
@@ -114,9 +121,15 @@ export default function CropModal({
       return;
     }
     if (found) {
-      setBox(found.box);
+      if (found.box) setBox(found.box);
       setHymnNumber(found.hymnNumber);
-      setHint("Auto-selected the main hymn — fine-tune the box, or just recognize.");
+      if (found.box) {
+        setHint("Auto-selected the main hymn — fine-tune the box, or just recognize.");
+      } else if (found.hymnNumber) {
+        setHint(`Detected hymn ${found.hymnNumber} — recognize to load it.`);
+      } else {
+        setHint(null);
+      }
     } else {
       setHint(null);
     }
