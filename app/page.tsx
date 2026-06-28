@@ -133,6 +133,9 @@ export default function Home() {
   // Inline rename: which song's name is being edited, and the working text.
   const [editingSongId, setEditingSongId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
+  // "Get sheet by number": opens the official high-res hymn PDF page for the
+  // user to download and re-upload (cleaner OMR input than a phone photo).
+  const [hymnQuery, setHymnQuery] = useState("");
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   // Photos awaiting the crop step, processed one at a time.
   const [cropQueue, setCropQueue] = useState<File[]>([]);
@@ -571,6 +574,20 @@ export default function Home() {
     setSongs((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   }, []);
 
+  /** Open the official high-res sheet page for a 새찬송가 number in a new tab.
+   * The user downloads the PDF there and uploads it — a clean scan recognizes
+   * far better than a phone photo. Numbers are zero-padded to 3 digits (1–645). */
+  const openHymnSheet = useCallback(() => {
+    const n = parseInt(hymnQuery.trim(), 10);
+    if (!Number.isFinite(n) || n < 1 || n > 645) return;
+    const padded = String(n).padStart(3, "0");
+    window.open(
+      `https://bibletoppt.com/hymn/sheet-music/${padded}`,
+      "_blank",
+      "noopener,noreferrer"
+    );
+  }, [hymnQuery]);
+
   /** Begin inline-editing a song's name (seeds the draft with the current name). */
   const startRename = useCallback((song: Song) => {
     setEditingSongId(song.id);
@@ -1002,6 +1019,45 @@ export default function Home() {
           {uploadNote && (
             <p className="text-xs font-medium text-amber-600">{uploadNote}</p>
           )}
+
+          {/* Get the official high-res sheet by hymn number — opens the source
+              page so the user downloads the PDF and uploads it (a clean scan
+              recognizes much better than a phone photo). */}
+          <div className="flex flex-col gap-1.5 rounded-2xl border border-stone-100 bg-stone-50 px-3 py-3">
+            <label
+              htmlFor="hymn-number"
+              className="text-xs font-bold uppercase tracking-wide text-stone-400"
+            >
+              Get official sheet by number
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="hymn-number"
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={645}
+                value={hymnQuery}
+                onChange={(e) => setHymnQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") openHymnSheet();
+                }}
+                placeholder="새찬송가 no. (1–645)"
+                className="w-40 rounded-full border border-stone-200 bg-white px-4 py-2 text-sm text-stone-700 outline-none focus:border-blue-400"
+              />
+              <button
+                onClick={openHymnSheet}
+                disabled={!hymnQuery.trim()}
+                className="inline-flex items-center gap-2 rounded-full bg-blue-900 px-4 py-2 text-sm font-bold text-white transition-colors hover:bg-blue-800 disabled:opacity-40"
+              >
+                Get sheet ↗
+              </button>
+            </div>
+            <p className="text-xs text-stone-400">
+              Opens the high-res PDF on bibletoppt.com — download it, then upload
+              it here. Clean scans recognize more accurately than photos.
+            </p>
+          </div>
         </section>
 
         {/* Library — every uploaded hymn with its own status */}
