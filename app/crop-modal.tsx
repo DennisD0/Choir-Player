@@ -12,7 +12,12 @@ type Box = HymnCropBox; // all fractions of the displayed image, 0..1
 
 type Mode = "move" | "nw" | "ne" | "sw" | "se";
 
-const INIT: Box = { x: 0.08, y: 0.08, w: 0.84, h: 0.84 };
+// Keep the complete vertical page by default. Hymnal photos commonly place the
+// first and final staves close to the paper edge; the previous 8% top/bottom
+// inset silently clipped one of them and left Audiveris with broken systems.
+// The horizontal inset isolates the intended page from a facing page; unlike
+// the old box, it does not trim the score vertically.
+const INIT: Box = { x: 0.08, y: 0, w: 0.84, h: 1 };
 
 /**
  * When a page holds two hymns (common in hymnals), guess the one the user

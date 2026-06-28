@@ -36,7 +36,7 @@ export interface MusicXmlQuality {
 }
 
 export function isReliableNoteTranscription(quality: MusicXmlQuality): boolean {
-  return (
+  const balancedScore =
     quality.score >= 480 &&
     quality.pitchedNotes >= 20 &&
     quality.partCount >= 1 &&
@@ -44,7 +44,37 @@ export function isReliableNoteTranscription(quality: MusicXmlQuality): boolean {
     quality.measureCount >= 4 &&
     quality.partNoteBalance >= 0.65 &&
     quality.partDurationBalance >= 0.6 &&
-    quality.hasTimeSignature
+    quality.hasTimeSignature;
+
+  // Photographed hymnals often omit a machine-readable time signature or are
+  // split by Audiveris into uneven voice parts. A large export with many notes
+  // and measures is still substantially more useful than a tiny, perfectly
+  // balanced fragment. Keep strict structural limits while allowing that
+  // high-coverage result through.
+  const substantialCoverage =
+    quality.score >= 350 &&
+    quality.pitchedNotes >= 100 &&
+    quality.partCount >= 1 &&
+    quality.partCount <= 4 &&
+    quality.measureCount >= 6;
+
+  return balancedScore || substantialCoverage;
+}
+
+/**
+ * Compare two valid exports by how much playable notation they contain.
+ * Audiveris can split one photographed page into several movement files. A
+ * short fragment with a time signature can have a higher metadata-weighted
+ * quality score than the main movement, so coverage must be the first key.
+ */
+export function compareMusicXmlCoverage(
+  left: MusicXmlQuality,
+  right: MusicXmlQuality
+): number {
+  return (
+    left.pitchedNotes - right.pitchedNotes ||
+    left.measureCount - right.measureCount ||
+    left.score - right.score
   );
 }
 
@@ -245,7 +275,7 @@ async function selectValidExport(
     }
   }
   if (valid.length > 0) {
-    valid.sort((a, b) => b.quality.score - a.quality.score);
+    valid.sort((a, b) => compareMusicXmlCoverage(b.quality, a.quality));
     return valid[0].path;
   }
   if (lastError instanceof Error) throw lastError;

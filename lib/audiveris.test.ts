@@ -6,10 +6,38 @@ import test from "node:test";
 import { DOMParser } from "@xmldom/xmldom";
 import JSZip from "jszip";
 import {
+  compareMusicXmlCoverage,
   isReliableNoteTranscription,
   prepareMusicXmlArchive,
   scoreMusicXmlArchive,
 } from "./audiveris.ts";
+
+test("prefers the main photographed movement over a metadata-rich fragment", () => {
+  const mainMovement = {
+    score: 380.63,
+    pitchedNotes: 142,
+    partCount: 2,
+    measureCount: 7,
+    partNoteBalance: 0.45,
+    partDurationBalance: 0.37,
+    hasKeySignature: false,
+    hasTimeSignature: false,
+  };
+  const timeSignatureFragment = {
+    score: 438,
+    pitchedNotes: 34,
+    partCount: 1,
+    measureCount: 7,
+    partNoteBalance: 1,
+    partDurationBalance: 1,
+    hasKeySignature: false,
+    hasTimeSignature: true,
+  };
+
+  assert.ok(compareMusicXmlCoverage(mainMovement, timeSignatureFragment) > 0);
+  assert.equal(isReliableNoteTranscription(mainMovement), true);
+  assert.equal(isReliableNoteTranscription(timeSignatureFragment), false);
+});
 
 test("removes lyric elements without consuming lyric-font or score structure", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "choire-mxl-"));
