@@ -141,6 +141,8 @@ export default function Home() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  const playerRef = useRef<HTMLElement>(null);
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
   const engineRef = useRef<AudioEngine | null>(null);
 
@@ -296,6 +298,40 @@ export default function Home() {
 
   }, []);
 
+  /** Keep the active system centered in the space between the sticky header
+   * and the fixed player. The player stays reachable while playback follows
+   * the score, so the user can pause without fighting the automatic scroll. */
+  const centerPlaybackMeasure = useCallback((measureIndex: number) => {
+    const container = containerRef.current;
+    const row = measureRectsRef.current[measureIndex];
+    if (!container || !row) return;
+
+    const selectedStaves = new Set<number>();
+    for (const part of partsRef.current) {
+      if (selectedRef.current.includes(part.role as VoiceFilter)) {
+        for (const staff of part.staves) selectedStaves.add(staff);
+      }
+    }
+
+    const selectedRects = row.filter(
+      (rect, staff) => rect && (selectedStaves.size === 0 || selectedStaves.has(staff))
+    ) as Rect[];
+    const rects = selectedRects.length ? selectedRects : row.filter(Boolean) as Rect[];
+    if (rects.length === 0) return;
+
+    const top = Math.min(...rects.map((rect) => rect.y));
+    const bottom = Math.max(...rects.map((rect) => rect.y + rect.h));
+    const containerBox = container.getBoundingClientRect();
+    const measureCenter = containerBox.top + (top + bottom) / 2;
+    const viewportTop = (headerRef.current?.getBoundingClientRect().bottom ?? 0) + 12;
+    const viewportBottom =
+      (playerRef.current?.getBoundingClientRect().top ?? window.innerHeight) - 12;
+    if (viewportBottom <= viewportTop) return;
+
+    const targetCenter = (viewportTop + viewportBottom) / 2;
+    window.scrollBy({ top: measureCenter - targetCenter, behavior: "smooth" });
+  }, []);
+
   /**
    * Map a playback position (ticks) to its measure (for the box) and to the
    * currently-sounding note onset (for the red note), and redraw if either
@@ -321,13 +357,13 @@ export default function Home() {
       if (measure === currentMeasureRef.current && onset === currentOnsetRef.current) {
         return;
       }
+      const measureChanged = measure !== currentMeasureRef.current;
       currentMeasureRef.current = measure;
       currentOnsetRef.current = onset;
-      // Highlight the current notes without moving the viewport. Users may be
-      // reading another system or reaching controls while playback continues.
       drawHighlights();
+      if (measureChanged) centerPlaybackMeasure(measure);
     },
-    [drawHighlights]
+    [drawHighlights, centerPlaybackMeasure]
   );
 
   const tick = useCallback(function animationTick() {
@@ -730,11 +766,12 @@ export default function Home() {
   const handlePlay = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine) return;
+    centerPlaybackMeasure(Math.max(0, currentMeasureRef.current));
     await engine.play();
     setIsPlaying(true);
     cancelLoop();
     rafRef.current = requestAnimationFrame(tick);
-  }, [tick, cancelLoop]);
+  }, [tick, cancelLoop, centerPlaybackMeasure]);
 
   const handlePause = useCallback(() => {
     engineRef.current?.pause();
@@ -843,7 +880,7 @@ export default function Home() {
   return (
     <div className="min-h-full flex flex-col">
       {/* Header — matches the church cafe site's top-left brand mark */}
-      <header className="bg-white border-b border-stone-100 sticky top-0 z-20 shadow-sm">
+      <header ref={headerRef} className="bg-white border-b border-stone-100 sticky top-0 z-20 shadow-sm">
         <div className="max-w-3xl mx-auto px-4 py-3 flex items-center gap-2.5">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
@@ -1156,6 +1193,7 @@ export default function Home() {
 
       {stage === "ready" && (
         <aside
+          ref={playerRef}
           className="fixed inset-x-0 bottom-0 z-40 px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))]"
           aria-label="Music player"
         >
