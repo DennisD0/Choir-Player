@@ -775,9 +775,14 @@ export default function Home() {
     [addToLibrary]
   );
 
-  /** Fetch the high-res PDF for a hymn number via our server proxy and
-   * drop it straight into the OMR pipeline — no manual download step.
-   * Converts 통합찬송가 numbers to 새찬송가 automatically. */
+  /** Fetch a hymn by number.
+   *
+   * Path A — verified MusicXML from GCS (instant, 100% accurate):
+   *   /api/hymn-musicxml/{collection}/{n} → .mxl loaded directly, no OMR.
+   *   Falls through on 404 (no verified score uploaded yet for this number).
+   *
+   * Path B — high-res PDF render + OMR (300 DPI, CLAHE preprocessing):
+   *   /api/hymn-sheet/{collection}/{n} → .png → Audiveris OMR pipeline. */
   const fetchHymnSheet = useCallback(async () => {
     const n = parseInt(hymnQuery.trim(), 10);
     const max = HYMNAL_MAX[hymnalEdition];
@@ -786,13 +791,27 @@ export default function Home() {
     setHymnFetchError(null);
     try {
       const collection = hymnalEdition === "찬송가" ? "chansonggah" : "gracesong";
+      const padded = String(n).padStart(3, "0");
+
+      // Path A: verified MusicXML — skip OMR entirely
+      const mxlRes = await fetch(`/api/hymn-musicxml/${collection}/${n}`);
+      if (mxlRes.ok) {
+        const blob = await mxlRes.blob();
+        const file = new File([blob], `${padded}장.mxl`, {
+          type: "application/vnd.recordare.musicxml+xml",
+        });
+        addToLibrary([file]);
+        setHymnQuery("");
+        return;
+      }
+
+      // Path B: PDF render → OMR fallback
       const res = await fetch(`/api/hymn-sheet/${collection}/${n}`);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `Failed to fetch sheet (${res.status})`);
       }
       const blob = await res.blob();
-      const padded = String(n).padStart(3, "0");
       const file = new File([blob], `${padded}장.png`, { type: "image/png" });
       addToLibrary([file]);
       setHymnQuery("");
