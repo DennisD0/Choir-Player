@@ -12,7 +12,6 @@ import CropModal from "./crop-modal";
 import type { AudioEngine } from "@/lib/audio-engine";
 import type { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
 import {
-  toNewHymnalNumber,
   HYMNAL_LABELS,
   HYMNAL_MAX,
   type HymnalEdition,
@@ -144,7 +143,7 @@ export default function Home() {
   const [hymnQuery, setHymnQuery] = useState("");
   const [hymnFetching, setHymnFetching] = useState(false);
   const [hymnFetchError, setHymnFetchError] = useState<string | null>(null);
-  const [hymnalEdition, setHymnalEdition] = useState<HymnalEdition>("unified");
+  const [hymnalEdition, setHymnalEdition] = useState<HymnalEdition>("찬송가");
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   // Photos awaiting the crop step, processed one at a time.
   const [cropQueue, setCropQueue] = useState<File[]>([]);
@@ -786,20 +785,15 @@ export default function Home() {
     setHymnFetching(true);
     setHymnFetchError(null);
     try {
-      const newNumber = toNewHymnalNumber(n, hymnalEdition);
-      if (newNumber === null) {
-        throw new Error(
-          `찬송가 ${n}장은 새찬송가에 수록되지 않은 곡입니다 (was removed in the 2006 revision).`
-        );
-      }
-      const res = await fetch(`/api/hymn-pdf/${newNumber}`);
+      const collection = hymnalEdition === "찬송가" ? "chansonggah" : "gracesong";
+      const res = await fetch(`/api/hymn-sheet/${collection}/${n}`);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `Failed to fetch sheet (${res.status})`);
       }
       const blob = await res.blob();
       const padded = String(n).padStart(3, "0");
-      const file = new File([blob], `${padded}장.jpg`, { type: "image/jpeg" });
+      const file = new File([blob], `${padded}장.png`, { type: "image/png" });
       addToLibrary([file]);
       setHymnQuery("");
     } catch (err) {
@@ -1056,7 +1050,7 @@ export default function Home() {
             </span>
             {/* Hymnal edition toggle */}
             <div className="flex gap-1.5">
-              {(["unified", "new"] as HymnalEdition[]).map((ed) => (
+              {(["찬송가", "은혜찬송"] as HymnalEdition[]).map((ed) => (
                 <button
                   key={ed}
                   onClick={() => { setHymnalEdition(ed); setHymnFetchError(null); }}

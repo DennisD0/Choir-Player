@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # libgomp1 — the bytedeco tesseract/leptonica native libs link against OpenMP and
 # fail to load with UnsatisfiedLinkError on a minimal JRE image without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libvips-dev libgomp1 python3 make g++ \
+    libvips-dev libgomp1 python3 make g++ poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # ── Audiveris JARs ────────────────────────────────────────────────────────────
@@ -54,6 +54,11 @@ COPY --from=builder /build/public ./public
 # Re-install sharp for linux so the native bindings match the runtime OS
 RUN npm install --no-save sharp
 
+# ── Hymnal PDF ────────────────────────────────────────────────────────────────
+# Place the combined 찬송가 + 은혜찬송 PDF at hymnal/hymnal.pdf in the project
+# root before building the image. It is gitignored (copyright).
+COPY hymnal/ /app/hymnal/
+
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV HOSTNAME=0.0.0.0
@@ -61,6 +66,9 @@ ENV HOSTNAME=0.0.0.0
 # Audiveris engine config (tells lib/audiveris.ts where to find the JARs)
 ENV AUDIVERIS_APP_DIR=/opt/audiveris/app
 ENV AUDIVERIS_TESSDATA_DIR=/opt/audiveris/tessdata
+
+# Hymnal PDF path inside the container
+ENV HYMNAL_PDF=/app/hymnal/hymnal.pdf
 
 EXPOSE 8080
 CMD ["node", "server.js"]
