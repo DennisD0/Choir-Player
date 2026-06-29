@@ -133,9 +133,11 @@ export default function Home() {
   // Inline rename: which song's name is being edited, and the working text.
   const [editingSongId, setEditingSongId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
-  // "Get sheet by number": opens the official high-res hymn PDF page for the
-  // user to download and re-upload (cleaner OMR input than a phone photo).
+  // "Get sheet by number": fetches the high-res PDF via our server proxy and
+  // feeds it straight into OMR — no manual download step.
   const [hymnQuery, setHymnQuery] = useState("");
+  const [hymnFetching, setHymnFetching] = useState(false);
+  const [hymnFetchError, setHymnFetchError] = useState<string | null>(null);
   const [uploadNote, setUploadNote] = useState<string | null>(null);
   // Photos awaiting the crop step, processed one at a time.
   const [cropQueue, setCropQueue] = useState<File[]>([]);
@@ -574,20 +576,6 @@ export default function Home() {
     setSongs((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
   }, []);
 
-  /** Open the official high-res sheet page for a 새찬송가 number in a new tab.
-   * The user downloads the PDF there and uploads it — a clean scan recognizes
-   * far better than a phone photo. Numbers are zero-padded to 3 digits (1–645). */
-  const openHymnSheet = useCallback(() => {
-    const n = parseInt(hymnQuery.trim(), 10);
-    if (!Number.isFinite(n) || n < 1 || n > 645) return;
-    const padded = String(n).padStart(3, "0");
-    window.open(
-      `https://bibletoppt.com/hymn/sheet-music/${padded}`,
-      "_blank",
-      "noopener,noreferrer"
-    );
-  }, [hymnQuery]);
-
   /** Begin inline-editing a song's name (seeds the draft with the current name). */
   const startRename = useCallback((song: Song) => {
     setEditingSongId(song.id);
@@ -780,6 +768,31 @@ export default function Home() {
     },
     [addToLibrary]
   );
+
+  /** Fetch the high-res PDF for a 새찬송가 number via our server proxy and
+   * drop it straight into the OMR pipeline — no manual download step. */
+  const fetchHymnSheet = useCallback(async () => {
+    const n = parseInt(hymnQuery.trim(), 10);
+    if (!Number.isFinite(n) || n < 1 || n > 645) return;
+    setHymnFetching(true);
+    setHymnFetchError(null);
+    try {
+      const res = await fetch(`/api/hymn-pdf/${n}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `Failed to fetch sheet (${res.status})`);
+      }
+      const blob = await res.blob();
+      const padded = String(n).padStart(3, "0");
+      const file = new File([blob], `${padded}장.pdf`, { type: "application/pdf" });
+      addToLibrary([file]);
+      setHymnQuery("");
+    } catch (err) {
+      setHymnFetchError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setHymnFetching(false);
+    }
+  }, [hymnQuery, addToLibrary]);
 
   /** Finish cropping the current photo: add the chosen region to the library. */
   const handleCropConfirm = useCallback(
@@ -1020,9 +1033,8 @@ export default function Home() {
             <p className="text-xs font-medium text-amber-600">{uploadNote}</p>
           )}
 
-          {/* Get the official high-res sheet by hymn number — opens the source
-              page so the user downloads the PDF and uploads it (a clean scan
-              recognizes much better than a phone photo). */}
+          {/* Get the official high-res sheet by number — fetches the PDF via
+              our server proxy and sends it straight into OMR (no manual step). */}
           <div className="flex flex-col gap-1.5 rounded-2xl border border-stone-100 bg-stone-50 px-3 py-3">
             <label
               htmlFor="hymn-number"
@@ -1038,24 +1050,37 @@ export default function Home() {
                 min={1}
                 max={645}
                 value={hymnQuery}
-                onChange={(e) => setHymnQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") openHymnSheet();
-                }}
+                onChange={(e) => { setHymnQuery(e.target.value); setHymnFetchError(null); }}
+                onKeyDown={(e) => { if (e.key === "Enter") void fetchHymnSheet(); }}
                 placeholder="새찬송가 no. (1–645)"
-                className="w-40 rounded-full border border-stone-200 bg-white px-4 py-2 text-sm text-stone-700 outline-none focus:border-blue-400"
+                disabled={hymnFetching}
+                className="w-40 rounded-full border border-stone-200 bg-white px-4 py-2 text-sm text-stone-700 outline-none focus:border-blue-400 disabled:opacity-50"
               />
               <button
-                onClick={openHymnSheet}
-                disabled={!hymnQuery.trim()}
+                onClick={() => void fetchHymnSheet()}
+                disabled={!hymnQuery.trim() || hymnFetching}
                 className="inline-flex items-center gap-2 rounded-full bg-blue-900 px-4 py-2 text-sm font-bold text-white transition-colors hover:bg-blue-800 disabled:opacity-40"
               >
-                Get sheet ↗
+                {hymnFetching ? (
+                  <>
+                    <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                    </svg>
+                    Fetching…
+                  </>
+                ) : (
+                  "Get sheet"
+                )}
               </button>
             </div>
+            {hymnFetchError && (
+              <p className="text-xs font-medium text-red-500">{hymnFetchError}</p>
+            )}
             <p className="text-xs text-stone-400">
-              Opens the high-res PDF on bibletoppt.com — download it, then upload
-              it here. Clean scans recognize more accurately than photos.
+              Type a 새찬송가 number (1–645) and tap Get sheet — the high-res PDF
+              loads automatically and starts recognizing. Clean scans recognize
+              more accurately than photos.
             </p>
           </div>
         </section>
